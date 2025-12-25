@@ -148,6 +148,49 @@ REACT_APP_API_URL=https://your-backend-api.com
 # Other frontend-specific variables
 ```
 
+## Local Setup on Your Mac
+
+If you're currently in `playstudy-card-dash` and need to work with the backend:
+
+### Step 1: Clone the Backend Repository
+
+```bash
+# Navigate to your project directory
+cd ~/Downloads/project-ps-full/
+
+# Clone the backend repository
+git clone https://github.com/Ifthikar20/plays-study-backend-auth.git
+
+# Rename to match your naming convention (optional)
+mv plays-study-backend-auth playstudy-backend
+
+# Enter the repository
+cd playstudy-backend
+```
+
+### Step 2: Verify the Structure
+
+```bash
+# You should see these files/directories:
+ls -la
+# Dockerfile ← This is KEY!
+# deploy/
+# app/
+# requirements.txt
+# etc.
+```
+
+### Step 3: Run Deployment from Backend Repo
+
+```bash
+# Set your AWS account ID
+export AWS_ACCOUNT_ID=817977750104
+
+# Run deployment
+cd deploy
+./deploy.sh
+```
+
 ## Troubleshooting
 
 ### "Dockerfile not found" Error
@@ -169,6 +212,15 @@ ls -la Dockerfile
 **Problem**: Looking in frontend repository for backend deploy scripts
 
 **Solution**: Backend deployment scripts are in `playstudy-backend/deploy/`
+
+### Script says "cd ../backend" but no backend directory exists
+**Problem**: Old deployment script bug (now fixed)
+
+**Solution**: Pull the latest changes:
+```bash
+cd ~/Downloads/project-ps-full/playstudy-backend
+git pull origin claude/clarify-repo-structure-8XVVO
+```
 
 ## Contact
 
