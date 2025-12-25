@@ -2,6 +2,24 @@
 
 FastAPI-based backend for the PlayStudy Card Dashboard application.
 
+## Repository Structure
+
+**IMPORTANT**: PlayStudy consists of two separate repositories:
+
+- **playstudy-backend** (THIS REPOSITORY) - Backend API with Dockerfile and deployment scripts
+- **playstudy-card-dash** - Frontend React application
+
+This repository contains:
+- ✅ Backend FastAPI application code
+- ✅ Dockerfile for containerization
+- ✅ `deploy/` directory with AWS ECS deployment scripts
+- ✅ Database migrations and models
+
+**Deployment Note**: Always run deployment scripts from THIS repository (playstudy-backend) because:
+- The Dockerfile is located here
+- The `deploy/` scripts reference the backend code
+- ECS deployments build and push the backend Docker image
+
 ## Features
 
 - ✅ FastAPI with async support
@@ -151,6 +169,7 @@ See [COST_ANALYSIS.md](./COST_ANALYSIS.md) for breakdown.
 
 ## Documentation
 
+- [Repository Structure](./REPOSITORY_STRUCTURE.md) - **START HERE** to understand the project layout
 - [AWS Deployment Guide](./AWS_ECS_DEPLOYMENT_GUIDE.md)
 - [Cost Analysis](./COST_ANALYSIS.md)
 - [Progress Batching](./PROGRESS_BATCHING.md)
