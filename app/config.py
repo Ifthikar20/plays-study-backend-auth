@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     ENVIRONMENT: str = "development"
 
+    # ML Recommendations
+    ENABLE_ML_RECOMMENDATIONS: bool = True
+    ML_SERVICE_URL: str = "http://localhost:8001"
+
     # AI Providers
     DEEPSEEK_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
