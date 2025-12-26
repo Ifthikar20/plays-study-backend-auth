@@ -70,8 +70,8 @@ ORIGIN_VAR_NAME=$(cat /tmp/current-task-def.json | \
 print_info "Current origins variable: $ORIGIN_VAR_NAME"
 print_info "Current value: $CURRENT_ORIGINS"
 
-# Set new origins value
-NEW_ORIGINS="http://${ALB_DNS},https://${ALB_DNS}"
+# Set new origins value (include localhost for development)
+NEW_ORIGINS="http://localhost:8080,http://${ALB_DNS},https://${ALB_DNS}"
 
 print_info "New ALLOWED_ORIGINS: $NEW_ORIGINS"
 echo ""
