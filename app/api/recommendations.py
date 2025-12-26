@@ -14,7 +14,7 @@ from app.database import get_db
 from app.models.user import User
 from app.models.game import Game
 from app.models.study_session import StudySession
-from app.core.auth import get_current_user
+from app.dependencies import get_current_user
 from app.schemas.game import GameResponse
 
 router = APIRouter(prefix="/recommendations", tags=["recommendations"])
