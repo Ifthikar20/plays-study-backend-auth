@@ -45,6 +45,14 @@
         {
           "name": "RATE_LIMIT_PER_HOUR",
           "value": "1000"
+        },
+        {
+          "name": "ML_SERVICE_URL",
+          "value": "http://ML_SERVICE_IP:8001"
+        },
+        {
+          "name": "ENABLE_ML_RECOMMENDATIONS",
+          "value": "true"
         }
       ],
       "secrets": [
