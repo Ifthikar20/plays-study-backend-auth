@@ -243,8 +243,9 @@ cat > /tmp/task-definition.json <<EOF
         {"name": "DATABASE_URL", "value": "postgresql://playstudy_admin:${DB_PASSWORD}@${DB_ENDPOINT}:5432/postgres?sslmode=require"},
         {"name": "REDIS_URL", "value": "redis://${REDIS_ENDPOINT}:6379/0"},
         {"name": "ML_SERVICE_URL", "value": "${ML_SERVICE_URL:-http://localhost:8001}"},
+        {"name": "ENABLE_ML_RECOMMENDATIONS", "value": "${ENABLE_ML_RECOMMENDATIONS:-true}"},
         {"name": "ENVIRONMENT", "value": "production"},
-        {"name": "ALLOWED_ORIGINS", "value": "http://playstudy-alb-1732754070.us-east-1.elb.amazonaws.com,https://playstudy-alb-1732754070.us-east-1.elb.amazonaws.com"},
+        {"name": "ALLOWED_ORIGINS", "value": "http://playstudy-alb-1732754070.us-east-1.elb.amazonaws.com,https://playstudy-alb-1732754070.us-east-1.elb.amazonaws.com,http://localhost:8080"},
         {"name": "SECRET_KEY", "value": "your-secret-key-change-in-production"},
         {"name": "FIELD_ENCRYPTION_KEY", "value": "your-encryption-key-change-in-production"}
       ],

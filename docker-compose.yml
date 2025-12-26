@@ -55,6 +55,7 @@ services:
       DATABASE_URL: postgresql+psycopg://playstudy_user:dev_password_change_in_production@postgres:5432/playstudy_db
       REDIS_URL: redis://redis:6379/0
       ML_SERVICE_URL: http://ml-service:8001
+      ENABLE_ML_RECOMMENDATIONS: ${ENABLE_ML_RECOMMENDATIONS:-true}
       SECRET_KEY: dev-secret-key-change-in-production
       FIELD_ENCRYPTION_KEY: dev-encryption-key-change-in-production
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}

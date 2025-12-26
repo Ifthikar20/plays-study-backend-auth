@@ -19,8 +19,9 @@ from app.schemas.game import GameResponse
 
 router = APIRouter(prefix="/recommendations", tags=["recommendations"])
 
-# Internal ML service URL (only accessible within VPC, not from internet)
+# Configuration
 ML_SERVICE_URL = os.getenv("ML_SERVICE_URL", "http://localhost:8001")
+ENABLE_ML_RECOMMENDATIONS = os.getenv("ENABLE_ML_RECOMMENDATIONS", "true").lower() == "true"
 
 
 # ===== HELPER FUNCTIONS =====
@@ -43,6 +44,31 @@ def get_user_play_history(db: Session, user_id: int):
 def get_all_active_games(db: Session) -> List[Game]:
     """Get all active games"""
     return db.query(Game).filter(Game.is_active == True).all()
+
+
+def get_fallback_recommendations(db: Session, user_id: int, limit: int, exclude_played: bool = True) -> List[Game]:
+    """
+    Fallback recommendations when ML service is disabled or unavailable.
+
+    Returns popular games (by rating and likes) that user hasn't played yet.
+    """
+    query = db.query(Game).filter(Game.is_active == True)
+
+    if exclude_played:
+        # Exclude games user has already played
+        played_game_ids = db.query(StudySession.game_id).filter(
+            StudySession.user_id == user_id,
+            StudySession.game_id.isnot(None)
+        ).distinct().subquery()
+
+        query = query.filter(~Game.id.in_(played_game_ids))
+
+    # Order by popularity (rating * likes for weighted popularity)
+    games = query.order_by(
+        (Game.rating * Game.likes).desc()
+    ).limit(limit).all()
+
+    return games
 
 
 async def call_ml_service(user_play_history: list, all_games: list, limit: int):
@@ -99,9 +125,8 @@ async def get_similar_games(
     Get game recommendations based on what you've played before.
 
     **How it works:**
-    - Analyzes games you've played and enjoyed
-    - Finds other games with similar attributes (category, difficulty, duration)
-    - Returns games you haven't played yet that match your preferences
+    - When ML is enabled: Analyzes games you've played and finds similar ones using ML
+    - When ML is disabled: Returns popular games you haven't played yet
 
     **Example:**
     If you've played:
@@ -117,23 +142,39 @@ async def get_similar_games(
 
     **Returns:**
     List of recommended games with full details
+
+    **Note:** Set ENABLE_ML_RECOMMENDATIONS=false to use fallback (popular games)
     """
-    # Get data from database
-    play_history = get_user_play_history(db, current_user.id)
-    all_games = get_all_active_games(db)
+    # Check if ML recommendations are enabled
+    if not ENABLE_ML_RECOMMENDATIONS:
+        # Fallback to popular games
+        games = get_fallback_recommendations(db, current_user.id, limit)
+        return [GameResponse.from_db_model(g) for g in games]
 
-    # Call internal ML service (not exposed to public)
-    ml_response = await call_ml_service(play_history, all_games, limit)
+    try:
+        # Get data from database
+        play_history = get_user_play_history(db, current_user.id)
+        all_games = get_all_active_games(db)
 
-    # Get recommended games by ID
-    recommended_game_ids = ml_response["game_ids"]
-    games = db.query(Game).filter(Game.id.in_(recommended_game_ids)).all()
+        # Call internal ML service (not exposed to public)
+        ml_response = await call_ml_service(play_history, all_games, limit)
 
-    # Preserve order from ML service
-    game_dict = {g.id: g for g in games}
-    ordered_games = [game_dict[gid] for gid in recommended_game_ids if gid in game_dict]
+        # Get recommended games by ID
+        recommended_game_ids = ml_response["game_ids"]
+        games = db.query(Game).filter(Game.id.in_(recommended_game_ids)).all()
 
-    return [GameResponse.from_db_model(g) for g in ordered_games]
+        # Preserve order from ML service
+        game_dict = {g.id: g for g in games}
+        ordered_games = [game_dict[gid] for gid in recommended_game_ids if gid in game_dict]
+
+        return [GameResponse.from_db_model(g) for g in ordered_games]
+
+    except Exception as e:
+        # If ML service fails, gracefully fall back to popular games
+        import logging
+        logging.warning(f"ML service failed, using fallback: {str(e)}")
+        games = get_fallback_recommendations(db, current_user.id, limit)
+        return [GameResponse.from_db_model(g) for g in games]
 
 
 @router.get("/similar/explained", response_model=List[dict])
@@ -158,33 +199,63 @@ async def get_similar_games_with_explanation(
     ```
 
     Useful for showing users WHY you're recommending each game.
+
+    **Note:** When ML is disabled, returns popular games with generic explanations
     """
-    # Get data from database
-    play_history = get_user_play_history(db, current_user.id)
-    all_games = get_all_active_games(db)
+    # Check if ML recommendations are enabled
+    if not ENABLE_ML_RECOMMENDATIONS:
+        # Fallback to popular games with generic explanations
+        games = get_fallback_recommendations(db, current_user.id, limit)
+        return [
+            {
+                "game": GameResponse.from_db_model(g),
+                "reason": "Popular game with high ratings",
+                "similarity_score": 0.0
+            }
+            for g in games
+        ]
 
-    # Call internal ML service
-    ml_response = await call_ml_service(play_history, all_games, limit)
+    try:
+        # Get data from database
+        play_history = get_user_play_history(db, current_user.id)
+        all_games = get_all_active_games(db)
 
-    # Get recommended games
-    recommended_game_ids = ml_response["game_ids"]
-    scores = ml_response["scores"]
-    explanations = ml_response["explanations"]
+        # Call internal ML service
+        ml_response = await call_ml_service(play_history, all_games, limit)
 
-    games = db.query(Game).filter(Game.id.in_(recommended_game_ids)).all()
-    game_dict = {g.id: g for g in games}
+        # Get recommended games
+        recommended_game_ids = ml_response["game_ids"]
+        scores = ml_response["scores"]
+        explanations = ml_response["explanations"]
 
-    # Build response with explanations
-    results = []
-    for i, game_id in enumerate(recommended_game_ids):
-        if game_id in game_dict:
-            results.append({
-                "game": GameResponse.from_db_model(game_dict[game_id]),
-                "reason": explanations[i],
-                "similarity_score": scores[i]
-            })
+        games = db.query(Game).filter(Game.id.in_(recommended_game_ids)).all()
+        game_dict = {g.id: g for g in games}
 
-    return results
+        # Build response with explanations
+        results = []
+        for i, game_id in enumerate(recommended_game_ids):
+            if game_id in game_dict:
+                results.append({
+                    "game": GameResponse.from_db_model(game_dict[game_id]),
+                    "reason": explanations[i],
+                    "similarity_score": scores[i]
+                })
+
+        return results
+
+    except Exception as e:
+        # Graceful fallback
+        import logging
+        logging.warning(f"ML service failed for explained endpoint, using fallback: {str(e)}")
+        games = get_fallback_recommendations(db, current_user.id, limit)
+        return [
+            {
+                "game": GameResponse.from_db_model(g),
+                "reason": "Popular game (ML service unavailable)",
+                "similarity_score": 0.0
+            }
+            for g in games
+        ]
 
 
 @router.get("/favorites", response_model=List[GameResponse])
