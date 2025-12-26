@@ -119,6 +119,26 @@ After running the fix:
 - ✓ Service status should remain "ACTIVE"
 - ✓ Health checks should pass after ~60 seconds
 
+## Common Follow-Up Issue: Missing Secrets
+
+After fixing the placeholder issue, you may encounter:
+
+```
+ResourceInitializationError: unable to pull secrets or registry auth:
+failed to fetch secret arn:aws:secretsmanager:us-east-1:817977750104:secret:playstudy/recaptcha-secret-key
+ResourceNotFoundException: Secrets Manager can't find the specified secret
+```
+
+**Solution**: The task definition references 7 secrets in AWS Secrets Manager that must exist before tasks can start.
+
+### Quick fix for missing secrets:
+
+```bash
+./check-and-create-secrets.sh
+```
+
+See **[SECRETS-SETUP.md](./SECRETS-SETUP.md)** for detailed instructions on creating and managing secrets.
+
 ## Troubleshooting
 
 ### If ML service IP is not found:
