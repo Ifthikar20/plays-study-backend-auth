@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def build_topic_hierarchy(session: StudySession, db: Session) -> List[TopicSchema]:
+def build_topic_hierarchy(session: StudySession, db: Session) -> List["TopicSchema"]:
     """
     Build hierarchical topic structure with questions for a study session.
     OPTIMIZED: Uses pre-loaded relationships when available to avoid N+1 queries.

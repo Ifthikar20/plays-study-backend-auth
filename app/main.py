@@ -11,7 +11,9 @@ from app.core.rate_limit import limiter
 from app.core.cache import redis_client
 from app.core.nonce_manager import nonce_manager
 from app.middleware.encryption_middleware import EncryptionMiddleware
-from app.api import auth, app_data, questions, study_sessions, tts, crypto, folders
+from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.middleware.audit_logging import AuditLoggingMiddleware
+from app.api import auth, app_data, questions, study_sessions, tts, crypto, folders, recommendations
 from app.database import Base, engine
 import logging
 
@@ -41,24 +43,17 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Add comprehensive security headers middleware
+app.add_middleware(SecurityHeadersMiddleware)
+logger.info("[Startup] ✅ Security headers middleware registered")
 
-# Security headers middleware
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    """Add security headers to all responses."""
-    response = await call_next(request)
-
-    # Security headers
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-
-    # HSTS header for production
-    if settings.ENVIRONMENT == "production":
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-
-    return response
-
+# Add audit logging middleware (logs WHO did WHAT, WHEN)
+app.add_middleware(
+    AuditLoggingMiddleware,
+    log_read_operations=False,  # Only log write operations (POST, PUT, PATCH, DELETE)
+    log_to_database=False,  # Just log to CloudWatch for now
+)
+logger.info("[Startup] ✅ Audit logging middleware registered")
 
 # CORS middleware
 app.add_middleware(
@@ -139,6 +134,12 @@ app.include_router(
     folders.router,
     prefix=settings.API_V1_PREFIX,
     tags=["Folders"],
+)
+
+app.include_router(
+    recommendations.router,
+    prefix=settings.API_V1_PREFIX,
+    tags=["Recommendations"],
 )
 
 

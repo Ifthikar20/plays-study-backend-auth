@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U playstudy_user"]
+      test: ["CMD-SHELL", "pg_isready -U playstudy_user -d playstudy_db"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -30,6 +30,21 @@ services:
       timeout: 3s
       retries: 5
 
+  # ML Recommendation Service (Internal Only)
+  ml-service:
+    build:
+      context: ./model-service
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"  # Exposed for local testing only
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -37,8 +52,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+psycopg://playstudy_user:dev_password_change_in_production@postgres:5432/playstudy_db
+      DATABASE_URL: postgresql://playstudy_user:dev_password_change_in_production@postgres:5432/playstudy_db
       REDIS_URL: redis://redis:6379/0
+      ML_SERVICE_URL: http://ml-service:8001
+      ENABLE_ML_RECOMMENDATIONS: ${ENABLE_ML_RECOMMENDATIONS:-true}
       SECRET_KEY: dev-secret-key-change-in-production
       FIELD_ENCRYPTION_KEY: dev-encryption-key-change-in-production
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -48,11 +65,13 @@ services:
       RECAPTCHA_SECRET_KEY: ${RECAPTCHA_SECRET_KEY:-}
       ENVIRONMENT: development
       DEBUG: "True"
-      ALLOWED_ORIGINS: http://localhost:5173,http://localhost:3000
+      ALLOWED_ORIGINS: http://localhost:5173,http://localhost:3000,http://localhost:8080
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      ml-service:
         condition: service_healthy
     volumes:
       - .:/app
