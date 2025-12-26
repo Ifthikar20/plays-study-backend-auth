@@ -52,7 +52,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+psycopg://playstudy_user:dev_password_change_in_production@postgres:5432/playstudy_db
+      DATABASE_URL: postgresql://playstudy_user:dev_password_change_in_production@postgres:5432/playstudy_db
       REDIS_URL: redis://redis:6379/0
       ML_SERVICE_URL: http://ml-service:8001
       ENABLE_ML_RECOMMENDATIONS: ${ENABLE_ML_RECOMMENDATIONS:-true}
