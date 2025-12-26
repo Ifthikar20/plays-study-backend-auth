@@ -28,7 +28,7 @@
         },
         {
           "name": "DATABASE_URL",
-          "value": "postgresql+psycopg://DB_USER:DB_PASS@DB_HOST:5432/playstudy_db"
+          "value": "postgresql://DB_USER:DB_PASS@DB_HOST:5432/playstudy_db?sslmode=require"
         },
         {
           "name": "REDIS_URL",

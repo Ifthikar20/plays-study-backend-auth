@@ -240,7 +240,7 @@ cat > /tmp/task-definition.json <<EOF
         }
       ],
       "environment": [
-        {"name": "DATABASE_URL", "value": "postgresql://playstudy_admin:${DB_PASSWORD}@${DB_ENDPOINT}:5432/postgres"},
+        {"name": "DATABASE_URL", "value": "postgresql://playstudy_admin:${DB_PASSWORD}@${DB_ENDPOINT}:5432/postgres?sslmode=require"},
         {"name": "REDIS_URL", "value": "redis://${REDIS_ENDPOINT}:6379/0"},
         {"name": "ENVIRONMENT", "value": "production"},
         {"name": "CORS_ORIGINS", "value": "*"},
