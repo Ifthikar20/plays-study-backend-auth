@@ -778,7 +778,9 @@ async def create_study_session_with_ai(
                 topics=len(result_topics),
                 hasFullStudy=True,
                 hasSpeedRun=True,
-                createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None
+                createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None,
+                progressiveLoad=False,  # Cached sessions have all questions already
+                questionsRemaining=0  # All questions already generated from cache
             )
 
         logger.info(f"📝 Cache MISS - Generating new AI content for hash {content_hash}")
@@ -1551,6 +1553,9 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
         # Calculate how many topics don't have questions yet (for progressive loading)
         topics_without_questions = len(all_subtopic_keys) - len(subtopics_to_generate)
 
+        # Handle both Pydantic model and dict access patterns (defensive coding)
+        progressive_load_value = data.progressive_load if hasattr(data, 'progressive_load') else data.get('progressive_load', False)
+
         return CreateStudySessionResponse(
             id=str(study_session.id),  # Convert UUID to string
             title=study_session.title,
@@ -1564,7 +1569,7 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
             hasFullStudy=True,
             hasSpeedRun=True,
             createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None,
-            progressiveLoad=data.progressive_load,
+            progressiveLoad=progressive_load_value,
             questionsRemaining=topics_without_questions
         )
 
