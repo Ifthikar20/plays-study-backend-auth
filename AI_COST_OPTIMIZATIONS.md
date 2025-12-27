@@ -3,6 +3,10 @@
 ## Summary
 Implemented comprehensive AI API cost optimizations that reduce monthly costs by **$180-450 (40-70% reduction)** while maintaining full functionality.
 
+## Important Note
+
+**BUG FIX (2025-12-27)**: Initial implementation incorrectly set DeepSeek `max_tokens=64000`. DeepSeek's actual limit is **8,192 tokens**. This has been corrected in commit 57ea84a. All DeepSeek calls now use the correct `max_tokens=8192` value.
+
 ## Changes Made
 
 ### 1. Reduced Default Questions Per Topic ✅
