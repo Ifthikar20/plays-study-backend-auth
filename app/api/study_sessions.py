@@ -29,6 +29,7 @@ from app.models.study_session import StudySession
 from app.models.topic import Topic
 from app.models.question import Question
 from app.models.flashcard import Flashcard
+from app.models.game_completion import GameCompletion
 from app.core.rate_limit import limiter
 from app.core.cache import get_cache, set_cache
 
@@ -2667,8 +2668,28 @@ async def get_session_workflow(
         Topic.study_session_id == uuid_obj
     ).group_by(Topic.id).all()
 
-    # Build workflow nodes
+    # Get all game completions for this user and session's topics
+    topic_ids = [topic.id for topic, _, _ in topics]
+    game_completions = db.query(GameCompletion).filter(
+        GameCompletion.user_id == current_user.id,
+        GameCompletion.topic_id.in_(topic_ids)
+    ).all()
+
+    # Create a map of topic_id -> list of game completions
+    games_by_topic = {}
+    for gc in game_completions:
+        if gc.topic_id not in games_by_topic:
+            games_by_topic[gc.topic_id] = []
+        games_by_topic[gc.topic_id].append({
+            "game_type": gc.game_type,
+            "completed": gc.completed,
+            "score": gc.score
+        })
+
+    # Build workflow nodes (topics + games)
     workflow_nodes = []
+    game_nodes = []
+
     for topic, question_count, flashcard_count in topics:
         workflow_stage = topic.workflow_stage or "locked"
 
@@ -2676,7 +2697,11 @@ async def get_session_workflow(
         quiz_completed = workflow_stage in ["quiz_completed", "flashcard_review", "completed"]
         flashcards_completed = workflow_stage == "completed"
 
+        # Games are recommended when flashcards are completed
+        games_available = flashcards_completed
+
         node = {
+            "node_type": "topic",  # Distinguish from game nodes
             "topic_id": topic.id,
             "title": topic.title,
             "description": topic.description,
@@ -2696,13 +2721,58 @@ async def get_session_workflow(
             # Helper fields for frontend React Flow implementation
             "quiz_completed": quiz_completed,  # True if quiz is done (flashcards now available)
             "flashcards_completed": flashcards_completed,  # True if flashcards are done (topic fully completed)
+            "games_available": games_available,  # True if games are recommended
+
+            # Game completion info for this topic
+            "games": games_by_topic.get(topic.id, [])
         }
         workflow_nodes.append(node)
+
+        # Add game nodes for completed topics
+        if games_available and not topic.is_category:
+            # Recommend primary games (Memory Match and True/False)
+            primary_games = [
+                {
+                    "game_type": "memory_match",
+                    "title": "🧠 Memory Match",
+                    "description": "Match concepts and definitions",
+                    "icon": "🧠"
+                },
+                {
+                    "game_type": "true_false",
+                    "title": "✓ True or False",
+                    "description": "Test your knowledge with scenarios",
+                    "icon": "✓"
+                }
+            ]
+
+            for game_info in primary_games:
+                # Check if this game has been completed
+                completed_game = next(
+                    (g for g in games_by_topic.get(topic.id, []) if g['game_type'] == game_info['game_type']),
+                    None
+                )
+
+                game_node = {
+                    "node_type": "game",
+                    "game_type": game_info['game_type'],
+                    "title": game_info['title'],
+                    "description": game_info['description'],
+                    "icon": game_info['icon'],
+                    "topic_id": topic.id,  # Link back to parent topic
+                    "topic_title": topic.title,
+                    "completed": completed_game['completed'] if completed_game else False,
+                    "score": completed_game['score'] if completed_game and completed_game['completed'] else None,
+                    "workflow_stage": "available",  # Games are always available once unlocked
+                }
+                game_nodes.append(game_node)
 
     return {
         "session_id": str(session.id),
         "title": session.title,
         "progress": session.progress,
-        "workflow_nodes": workflow_nodes,
-        "total_nodes": len(workflow_nodes)
+        "workflow_nodes": workflow_nodes,  # Topic nodes
+        "game_nodes": game_nodes,  # Game nodes (separate for easier frontend rendering)
+        "total_nodes": len(workflow_nodes),
+        "total_games": len(game_nodes)
     }
