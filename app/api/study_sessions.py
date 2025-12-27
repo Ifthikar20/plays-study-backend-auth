@@ -719,14 +719,25 @@ async def create_study_session_with_ai(
             db.flush()
 
             # Recreate topics and questions from cached structure
+            first_leaf_topic_initialized = False
             for topic_data in cached_result['topics']:
+                # Determine initial workflow stage
+                # First non-category topic should be quiz_available, others locked
+                is_category = topic_data['is_category']
+                if not is_category and not first_leaf_topic_initialized:
+                    initial_workflow_stage = "quiz_available"
+                    first_leaf_topic_initialized = True
+                else:
+                    initial_workflow_stage = "locked"
+
                 topic = Topic(
                     study_session_id=study_session.id,
                     parent_topic_id=topic_data.get('parent_topic_id'),
                     title=topic_data['title'],
                     description=topic_data['description'],
                     order_index=topic_data['order_index'],
-                    is_category=topic_data['is_category']
+                    is_category=is_category,
+                    workflow_stage=initial_workflow_stage
                 )
                 db.add(topic)
                 db.flush()
@@ -957,6 +968,7 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
         all_topics = []
         subtopic_map = {}  # Map to track subtopics for batch question assignment
         overall_idx = 0
+        first_leaf_topic_created = {'value': False}  # Track if first leaf topic has been created (use dict for mutability in closure)
 
         # Recursive helper function to create topics at any depth
         def create_topics_recursive(
@@ -984,6 +996,15 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
             has_children = len(subtopics_data) > 0
             is_leaf = not has_children
 
+            # Determine initial workflow stage
+            # First leaf topic (non-category) should be quiz_available, all others locked
+            if is_leaf and not first_leaf_topic_created['value']:
+                initial_workflow_stage = "quiz_available"
+                first_leaf_topic_created['value'] = True
+                logger.info(f"🎯 First leaf topic '{topic_data['title']}' (path: {path}) - setting to quiz_available")
+            else:
+                initial_workflow_stage = "locked"
+
             # Create topic in database
             topic = Topic(
                 study_session_id=study_session.id,
@@ -991,7 +1012,8 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
                 title=topic_data["title"],
                 description=topic_data.get("description", ""),
                 order_index=order_index,
-                is_category=has_children  # Non-leaf nodes are categories
+                is_category=has_children,  # Non-leaf nodes are categories
+                workflow_stage=initial_workflow_stage
             )
             db.add(topic)
             db.flush()
