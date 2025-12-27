@@ -1218,7 +1218,7 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
                         try:
                             batch_response = deepseek_client.chat.completions.create(
                                 model="deepseek-chat",
-                                max_tokens=64000,  # DeepSeek supports larger output
+                                max_tokens=8192,  # DeepSeek max limit is 8192, not 64000!
                                 temperature=0.7,
                                 messages=[{"role": "user", "content": batch_prompt}]
                             )
@@ -1851,7 +1851,7 @@ REMINDER: The response MUST include questions for ALL {len(next_batch)} topics l
         if deepseek_client:
             batch_response = deepseek_client.chat.completions.create(
                 model="deepseek-chat",
-                max_tokens=64000,  # DeepSeek supports larger output
+                max_tokens=8192,  # DeepSeek max limit is 8192, not 64000!
                 temperature=0.7,
                 messages=[{"role": "user", "content": batch_prompt}]
             )
