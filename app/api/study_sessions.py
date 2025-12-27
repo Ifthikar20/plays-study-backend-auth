@@ -501,8 +501,8 @@ class CreateStudySessionRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     content: str = Field(..., min_length=10, max_length=100000000)  # 100MB limit for base64 encoded files (large PDFs)
     num_topics: int = Field(default=4, ge=1, le=100)  # Dynamic: 1-100 topics based on content size
-    questions_per_topic: int = Field(default=15, ge=5, le=100)  # OPTIMIZED: Reduced from 50 to 15 for cost savings (40% reduction)
-    progressive_load: bool = Field(default=True)  # ENABLED: Generate questions progressively for faster initial load
+    questions_per_topic: int = Field(default=30, ge=5, le=100)  # Generate 30 questions per topic for comprehensive coverage
+    progressive_load: bool = Field(default=False)  # DISABLED: Generate ALL questions and flashcards upfront for complete experience
 
 
 class AnalyzeContentRequest(BaseModel):
@@ -1113,8 +1113,8 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
 
 CRITICAL: Generate high-quality, comprehensive questions AND flashcards:
 - Extract the MOST IMPORTANT testable concepts, facts, principles, definitions, and examples from the material
-- Aim for 15-20 high-quality questions per topic (quality over quantity)
-- Generate 3-5 flashcards per topic for post-quiz review (spaced repetition learning)
+- Aim for 25-35 high-quality questions per topic for comprehensive coverage
+- Generate 10-15 flashcards per topic for post-quiz review (spaced repetition learning)
 - Break down key concepts into multiple questions from different angles
 - Test each concept in multiple ways: definition, application, comparison, analysis, synthesis, evaluation
 - Create questions for the most important content in the study material
@@ -1157,8 +1157,9 @@ TOPICS TO COVER ({len(batch_keys)} topics in this batch):
 {subtopics_list}
 
 Requirements:
-1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch)
-2. Extract the MOST IMPORTANT testable information from the study material
+1. Generate 25-35 high-quality questions for EACH topic (total ~50-70 questions for this batch)
+2. Generate 10-15 flashcards for EACH topic for spaced repetition review
+3. Extract the MOST IMPORTANT testable information from the study material
 3. NO DUPLICATES - each question must test a unique concept or angle
 4. For EACH topic, include multiple EXAMPLE-BASED questions (e.g., "Which scenario is an example of operant conditioning?")
 5. Each question must have exactly 4 PLAUSIBLE options (all should seem correct to someone who doesn't understand deeply)
@@ -1187,10 +1188,10 @@ IMPORTANT INSTRUCTIONS:
 - START your response IMMEDIATELY with the opening brace: {{
 - Generate the complete JSON response now
 
-GOAL: Create 15-20 comprehensive questions per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
+GOAL: Create 25-35 comprehensive questions per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
 
 FLASHCARD REQUIREMENTS:
-- Generate 3-5 flashcards per topic for post-quiz review
+- Generate 10-15 flashcards per topic for post-quiz review
 - Flashcards should cover KEY DEFINITIONS, CONCEPTS, and TERMS
 - Front: Question or term (concise, clear)
 - Back: Answer or definition (comprehensive but digestible)
@@ -1202,7 +1203,7 @@ CRITICAL REQUIREMENTS:
 - You MUST generate questions AND flashcards for EVERY SINGLE topic key listed above - NO EXCEPTIONS
 - If a topic is listed, it MUST appear in your JSON response with questions AND flashcards
 - Missing even ONE topic key will result in incomplete learning coverage
-- Each topic MUST have 15-20 questions (aim for 20 when possible) AND 3-5 flashcards
+- Each topic MUST have 25-35 questions (aim for 35 when possible) AND 10-15 flashcards
 
 Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic listed must be in the response):
 {{
@@ -1217,7 +1218,7 @@ Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic
           "sourceText": "The complete sentence or paragraph from the study material with context.",
           "sourcePage": null
         }},
-        ... (10-30+ questions for topic "0")
+        ... (25-35 questions for topic "0")
       ],
       "flashcards": [
         {{
@@ -1225,17 +1226,17 @@ Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic
           "back": "X is defined as...",
           "hint": "Remember: X starts with..."
         }},
-        ... (3-5 flashcards for topic "0")
+        ... (10-15 flashcards for topic "0")
       ]
     }},
     "0-1": {{
       "questions": [
         {{question object}},
-        ... (10-30+ questions for topic "0-1")
+        ... (25-35 questions for topic "0-1")
       ],
       "flashcards": [
         {{flashcard object}},
-        ... (3-5 flashcards for topic "0-1")
+        ... (10-15 flashcards for topic "0-1")
       ]
     }},
     ... (MUST include ALL topic keys from the list above)
@@ -1803,11 +1804,12 @@ async def generate_more_questions(
             subtopics_list += f"Parent Category: {category_title}\n"
 
     # Build prompt
-    batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions for EACH of the following topics from the study material.
+    batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions AND flashcards for EACH of the following topics from the study material.
 
-CRITICAL: Generate the ABSOLUTE MAXIMUM number of questions possible:
+CRITICAL: Generate the ABSOLUTE MAXIMUM number of questions and flashcards possible:
 - Extract EVERY testable concept, fact, principle, detail, definition, example, and implication from the material
-- DO NOT impose any limits on the number of questions - generate as many as the content supports (aim for 15-30+ questions per topic)
+- DO NOT impose any limits on the number of questions - generate as many as the content supports (aim for 25-35+ questions per topic)
+- Generate 10-15 flashcards per topic for spaced repetition learning
 - Break down EVERY concept into multiple questions from different angles
 - Test each concept in multiple ways: definition, application, comparison, analysis, synthesis, evaluation
 - Create questions for every sentence that contains testable information
@@ -1849,8 +1851,9 @@ TOPICS TO COVER ({len(next_batch)} topics in this batch):
 {subtopics_list}
 
 Requirements:
-1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch)
-2. Extract the MOST IMPORTANT testable information from the study material
+1. Generate 25-35 high-quality questions for EACH topic (total ~50-70 questions for this batch)
+2. Generate 10-15 flashcards for EACH topic for spaced repetition review
+3. Extract the MOST IMPORTANT testable information from the study material
 3. NO DUPLICATES - each question must test a unique concept or angle
 4. For EACH topic, include multiple EXAMPLE-BASED questions (e.g., "Which scenario is an example of...?")
 5. Each question must have exactly 4 PLAUSIBLE options (all should seem correct to someone who doesn't understand deeply)
@@ -1879,13 +1882,21 @@ IMPORTANT INSTRUCTIONS:
 - START your response IMMEDIATELY with the opening brace: {{
 - Generate the complete JSON response now
 
-GOAL: Create 15-20 comprehensive questions per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
+GOAL: Create 25-35 comprehensive questions AND 10-15 flashcards per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
+
+FLASHCARD REQUIREMENTS:
+- Generate 10-15 flashcards per topic for post-quiz review
+- Flashcards should cover KEY DEFINITIONS, CONCEPTS, and TERMS
+- Front: Question or term (concise, clear)
+- Back: Answer or definition (comprehensive but digestible)
+- Hint: Optional memory aid or mnemonic (can be null)
+- Flashcards complement questions - focus on memorization and quick recall
 
 CRITICAL REQUIREMENTS:
-- You MUST generate questions for EVERY SINGLE topic key listed above - NO EXCEPTIONS
-- If a topic is listed, it MUST appear in your JSON response with questions
+- You MUST generate questions AND flashcards for EVERY SINGLE topic key listed above - NO EXCEPTIONS
+- If a topic is listed, it MUST appear in your JSON response with questions AND flashcards
 - Missing even ONE topic key will result in incomplete learning coverage
-- Each topic MUST have 15-20 questions (aim for 20 when possible)
+- Each topic MUST have 25-35 questions (aim for 35 when possible) AND 10-15 flashcards
 
 Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic listed must be in the response):
 {{
@@ -1900,20 +1911,32 @@ Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic
           "sourceText": "The complete sentence or paragraph from the study material with context.",
           "sourcePage": null
         }},
-        ... (10-30+ questions for topic "topic-123")
+        ... (25-35 questions for topic "topic-123")
+      ],
+      "flashcards": [
+        {{
+          "front": "What is the definition of X?",
+          "back": "X is defined as...",
+          "hint": "Remember: X starts with..."
+        }},
+        ... (10-15 flashcards for topic "topic-123")
       ]
     }},
     "topic-456": {{
       "questions": [
         {{question object}},
-        ... (10-30+ questions for topic "topic-456")
+        ... (25-35 questions for topic "topic-456")
+      ],
+      "flashcards": [
+        {{flashcard object}},
+        ... (10-15 flashcards for topic "topic-456")
       ]
     }},
     ... (MUST include ALL topic keys from the list above)
   }}
 }}
 
-REMINDER: The response MUST include questions for ALL {len(next_batch)} topics listed above. Double-check that every topic key appears in your JSON response."""
+REMINDER: The response MUST include questions AND flashcards for ALL {len(next_batch)} topics listed above. Double-check that every topic key appears in your JSON response."""
 
     # Make API call
     logger.info(f"📊 Prompt length: {len(batch_prompt):,} characters")
