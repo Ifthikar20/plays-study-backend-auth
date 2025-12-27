@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from datetime import datetime
 from openai import OpenAI
 from anthropic import Anthropic
