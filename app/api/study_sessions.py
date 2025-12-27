@@ -503,7 +503,7 @@ class CreateStudySessionRequest(BaseModel):
     content: str = Field(..., min_length=10, max_length=100000000)  # 100MB limit for base64 encoded files (large PDFs)
     num_topics: int = Field(default=4, ge=1, le=100)  # Dynamic: 1-100 topics based on content size
     questions_per_topic: int = Field(default=30, ge=5, le=100)  # Generate 30 questions per topic for comprehensive coverage
-    progressive_load: bool = Field(default=False)  # DISABLED: Generate ALL questions and flashcards upfront for complete experience
+    progressive_load: bool = Field(default=True)  # ENABLED: Generate questions incrementally using DeepSeek (cheaper) - initial batch only, then call /generate-more-questions
 
 
 class AnalyzeContentRequest(BaseModel):
@@ -2042,11 +2042,13 @@ REMINDER: The response MUST include questions AND flashcards for ALL {len(next_b
         logger.error(f"❌ Failed to parse questions: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to parse AI response: {str(e)}")
 
-    # Save questions to database
+    # Save questions and flashcards to database
     total_questions_generated = 0
+    total_flashcards_generated = 0
 
     for key, topic in subtopic_map.items():
         questions_data = subtopics_questions.get(key, {}).get("questions", [])
+        flashcards_data = subtopics_questions.get(key, {}).get("flashcards", [])
 
         if not questions_data:
             logger.warning(f"⚠️ No questions generated for subtopic '{key}' ('{topic.title}')")
@@ -2054,6 +2056,7 @@ REMINDER: The response MUST include questions AND flashcards for ALL {len(next_b
 
         logger.info(f"✅ Saving {len(questions_data)} questions for subtopic '{topic.title}'")
 
+        # Save questions
         for q_idx, q_data in enumerate(questions_data):
             # Ensure options is a list
             options = q_data.get("options", ["A", "B", "C", "D"])
@@ -2076,10 +2079,24 @@ REMINDER: The response MUST include questions AND flashcards for ALL {len(next_b
             db.add(question)
             total_questions_generated += 1
 
+        # Save flashcards
+        if flashcards_data:
+            logger.info(f"💳 Saving {len(flashcards_data)} flashcards for subtopic '{topic.title}'")
+            for f_idx, f_data in enumerate(flashcards_data):
+                flashcard = Flashcard(
+                    topic_id=topic.id,
+                    front=f_data.get("front", ""),
+                    back=f_data.get("back", ""),
+                    hint=f_data.get("hint"),
+                    order_index=f_idx
+                )
+                db.add(flashcard)
+                total_flashcards_generated += 1
+
     # Commit to database
     try:
         db.commit()
-        logger.info(f"✅ Successfully saved {total_questions_generated} questions to database")
+        logger.info(f"✅ Successfully saved {total_questions_generated} questions and {total_flashcards_generated} flashcards to database")
     except Exception as e:
         db.rollback()
         logger.error(f"❌ Failed to save questions: {e}")
@@ -2088,13 +2105,14 @@ REMINDER: The response MUST include questions AND flashcards for ALL {len(next_b
     # Count remaining subtopics without questions
     remaining_count = len(subtopics_without_questions) - len(next_batch)
 
-    logger.info(f"✅ Generated {total_questions_generated} questions for {len(next_batch)} subtopics")
+    logger.info(f"✅ Generated {total_questions_generated} questions and {total_flashcards_generated} flashcards for {len(next_batch)} subtopics")
     logger.info(f"📊 Remaining subtopics without questions: {remaining_count}")
 
     return {
         "message": f"Successfully generated questions for {len(next_batch)} subtopics",
         "generated": len(next_batch),
         "totalQuestions": total_questions_generated,
+        "totalFlashcards": total_flashcards_generated,
         "remaining": remaining_count,
         "hasMore": remaining_count > 0
     }
