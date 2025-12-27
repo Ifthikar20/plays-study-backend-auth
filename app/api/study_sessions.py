@@ -2183,6 +2183,12 @@ async def update_topic_progress(
     topic.current_question_index = data.current_question_index
     topic.completed = data.completed
 
+    # Handle workflow stage transitions
+    # When quiz is completed, transition to flashcard_review stage
+    if data.completed and topic.workflow_stage == "quiz_available":
+        topic.workflow_stage = "flashcard_review"
+        logger.info(f"✅ Quiz completed for topic {topic_id} ({topic.title}) - transitioning to flashcard_review stage")
+
     # Update session progress (percentage of completed subtopics)
     all_topics = db.query(Topic).filter(
         Topic.study_session_id == uuid_obj,
@@ -2202,6 +2208,7 @@ async def update_topic_progress(
         "score": topic.score,
         "current_question_index": topic.current_question_index,
         "completed": topic.completed,
+        "workflow_stage": topic.workflow_stage,
         "session_progress": session.progress
     }
 
@@ -2489,6 +2496,82 @@ async def submit_flashcard_review(
     }
 
 
+@router.post("/topics/{topic_id}/flashcards/complete")
+async def mark_flashcards_complete(
+    topic_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Mark all flashcards for a topic as completed.
+
+    This endpoint is called when the user finishes reviewing all flashcards
+    for a topic. It:
+    1. Updates the topic's workflow_stage to "completed"
+    2. Unlocks next topics (topics that have this topic as a prerequisite)
+
+    This is the final step in the workflow: quiz → flashcards → complete
+
+    Returns:
+        Success status and list of newly unlocked topics
+    """
+    # Verify topic exists and belongs to user's session
+    topic = db.query(Topic).join(StudySession).filter(
+        Topic.id == topic_id,
+        StudySession.user_id == current_user.id
+    ).first()
+
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+    # Update topic workflow stage to completed
+    topic.workflow_stage = "completed"
+    topic.completed = True
+
+    logger.info(f"✅ Topic {topic_id} ({topic.title}) marked as completed (flashcards done)")
+
+    # Unlock next topics (topics that have this topic as a prerequisite)
+    unlocked_topics = []
+
+    # Find all topics that have this topic in their prerequisites
+    dependent_topics = db.query(Topic).filter(
+        Topic.study_session_id == topic.study_session_id,
+        Topic.prerequisite_topic_ids.contains([topic_id])  # PostgreSQL array contains
+    ).all()
+
+    for dependent in dependent_topics:
+        # Check if ALL prerequisites are now completed
+        if dependent.prerequisite_topic_ids:
+            prerequisites = db.query(Topic).filter(
+                Topic.id.in_(dependent.prerequisite_topic_ids)
+            ).all()
+
+            all_prerequisites_completed = all(
+                prereq.workflow_stage == "completed"
+                for prereq in prerequisites
+            )
+
+            if all_prerequisites_completed and dependent.workflow_stage == "locked":
+                # Unlock this topic!
+                dependent.workflow_stage = "quiz_available"
+                unlocked_topics.append({
+                    "topic_id": dependent.id,
+                    "title": dependent.title
+                })
+                logger.info(f"🔓 Unlocked topic {dependent.id} ({dependent.title}) - all prerequisites completed")
+
+    db.commit()
+
+    return {
+        "success": True,
+        "topic_id": topic_id,
+        "title": topic.title,
+        "workflow_stage": "completed",
+        "unlocked_topics": unlocked_topics,
+        "unlocked_count": len(unlocked_topics)
+    }
+
+
 # ===== WORKFLOW VISUALIZATION ENDPOINT =====
 
 @router.get("/sessions/{session_id}/workflow")
@@ -2537,6 +2620,12 @@ async def get_session_workflow(
     # Build workflow nodes
     workflow_nodes = []
     for topic, question_count, flashcard_count in topics:
+        workflow_stage = topic.workflow_stage or "locked"
+
+        # Helper fields for frontend (derived from workflow_stage)
+        quiz_completed = workflow_stage in ["quiz_completed", "flashcard_review", "completed"]
+        flashcards_completed = workflow_stage == "completed"
+
         node = {
             "topic_id": topic.id,
             "title": topic.title,
@@ -2544,7 +2633,7 @@ async def get_session_workflow(
             "is_category": topic.is_category,
             "parent_topic_id": topic.parent_topic_id,
             "order_index": topic.order_index,
-            "workflow_stage": topic.workflow_stage or "locked",
+            "workflow_stage": workflow_stage,
             "position_x": topic.position_x,
             "position_y": topic.position_y,
             "prerequisite_topic_ids": topic.prerequisite_topic_ids or [],
@@ -2552,7 +2641,11 @@ async def get_session_workflow(
             "flashcard_count": flashcard_count,
             "completed": topic.completed,
             "score": topic.score,
-            "current_question_index": topic.current_question_index
+            "current_question_index": topic.current_question_index,
+
+            # Helper fields for frontend React Flow implementation
+            "quiz_completed": quiz_completed,  # True if quiz is done (flashcards now available)
+            "flashcards_completed": flashcards_completed,  # True if flashcards are done (topic fully completed)
         }
         workflow_nodes.append(node)
 
