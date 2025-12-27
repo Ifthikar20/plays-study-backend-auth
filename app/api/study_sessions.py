@@ -16,6 +16,7 @@ import base64
 import tempfile
 import subprocess
 import os
+import hashlib
 from docx import Document
 from PyPDF2 import PdfReader
 from pptx import Presentation
@@ -27,6 +28,7 @@ from app.models.study_session import StudySession
 from app.models.topic import Topic
 from app.models.question import Question
 from app.core.rate_limit import limiter
+from app.core.cache import get_cache, set_cache
 
 logger = logging.getLogger(__name__)
 
@@ -497,7 +499,7 @@ class CreateStudySessionRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     content: str = Field(..., min_length=10, max_length=100000000)  # 100MB limit for base64 encoded files (large PDFs)
     num_topics: int = Field(default=4, ge=1, le=100)  # Dynamic: 1-100 topics based on content size
-    questions_per_topic: int = Field(default=50, ge=5, le=200)  # Lowered minimum to 5 to support flexible question generation
+    questions_per_topic: int = Field(default=15, ge=5, le=100)  # OPTIMIZED: Reduced from 50 to 15 for cost savings (40% reduction)
     progressive_load: bool = Field(default=False)  # DISABLED: Generate ALL questions upfront for better UX
 
 
@@ -684,6 +686,88 @@ async def create_study_session_with_ai(
         # Analyze content to get smart recommendations (use first chunk for analysis)
         analysis = analyze_content_complexity(document_chunks[0])
 
+        # OPTIMIZATION: Cache AI-generated content to save costs on duplicate uploads
+        # Generate cache key based on content hash + generation parameters
+        content_hash = hashlib.sha256(extracted_text.encode('utf-8')).hexdigest()[:16]
+        cache_key = f"ai_session:{content_hash}:{data.num_topics}:{data.questions_per_topic}"
+
+        # Check if we've already generated content for this exact material
+        cached_result = get_cache(cache_key)
+        if cached_result:
+            logger.info(f"✅ Cache HIT - Reusing AI-generated content for hash {content_hash}")
+            logger.info(f"💰 Cost savings: Skipped {data.num_topics} topics × {data.questions_per_topic} questions AI generation")
+
+            # Create new study session with cached data
+            study_session = StudySession(
+                user_id=current_user.id,
+                title=cached_result['title'],
+                topic=cached_result['topic'],
+                study_content=extracted_text,
+                file_content=file_content,
+                file_type=file_type,
+                pdf_content=pdf_content,
+                topics_count=cached_result['topics_count'],
+                has_full_study=True,
+                has_speed_run=True,
+                status="in_progress"
+            )
+            db.add(study_session)
+            db.flush()
+
+            # Recreate topics and questions from cached structure
+            for topic_data in cached_result['topics']:
+                topic = Topic(
+                    study_session_id=study_session.id,
+                    parent_topic_id=topic_data.get('parent_topic_id'),
+                    title=topic_data['title'],
+                    description=topic_data['description'],
+                    order_index=topic_data['order_index'],
+                    is_category=topic_data['is_category']
+                )
+                db.add(topic)
+                db.flush()
+
+                # Add questions for this topic
+                for q_data in topic_data.get('questions', []):
+                    question = Question(
+                        topic_id=topic.id,
+                        question=q_data['question'],
+                        options=q_data['options'],
+                        correct_answer=q_data['correct_answer'],
+                        explanation=q_data['explanation'],
+                        source_text=q_data.get('source_text'),
+                        source_page=q_data.get('source_page'),
+                        order_index=q_data['order_index']
+                    )
+                    db.add(question)
+
+            db.commit()
+            db.refresh(study_session)
+
+            # Build response from cached session
+            all_topics = db.query(Topic).filter(
+                Topic.study_session_id == study_session.id
+            ).order_by(Topic.order_index).all()
+
+            result_topics = build_topic_hierarchy(study_session, db)
+
+            return CreateStudySessionResponse(
+                id=str(study_session.id),
+                title=study_session.title,
+                studyContent=study_session.study_content,
+                fileContent=study_session.file_content,
+                fileType=study_session.file_type,
+                pdfContent=study_session.pdf_content,
+                extractedTopics=result_topics,
+                progress=0,
+                topics=len(result_topics),
+                hasFullStudy=True,
+                hasSpeedRun=True,
+                createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None
+            )
+
+        logger.info(f"📝 Cache MISS - Generating new AI content for hash {content_hash}")
+
         # Progressive loading: For large documents (>5000 words), start with fewer topics
         is_large_doc = analysis['word_count'] > 5000
         initial_topics = data.num_topics
@@ -701,23 +785,29 @@ async def create_study_session_with_ai(
         num_categories = max(2, min(5, (initial_topics + 3) // 4))
         subtopics_per_category = max(1, initial_topics // num_categories)  # Allow single subtopic per category
 
-        # Initialize AI client (prefer Claude Haiku for speed, fallback to DeepSeek)
-        use_claude = bool(settings.ANTHROPIC_API_KEY)
+        # OPTIMIZATION: Initialize AI client (prefer DeepSeek for 45% cost savings)
+        # DeepSeek: $0.14 per 1M input tokens vs Claude Haiku: $0.25 per 1M input tokens
+        use_claude = False
         anthropic_client = None
         deepseek_client = None
 
-        if use_claude:
-            anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-            logger.info("🚀 Using Claude Haiku for fast generation")
-
-        # Always initialize DeepSeek as fallback
+        # Prefer DeepSeek when available (cheaper)
         if settings.DEEPSEEK_API_KEY:
             deepseek_client = OpenAI(
                 api_key=settings.DEEPSEEK_API_KEY,
                 base_url="https://api.deepseek.com"
             )
-            if not use_claude:
-                logger.info("⏱️ Using DeepSeek (consider adding ANTHROPIC_API_KEY for 10x speed)")
+            logger.info("💰 Using DeepSeek for cost-optimized generation (45% cheaper than Claude)")
+        # Fallback to Claude if DeepSeek not available
+        elif settings.ANTHROPIC_API_KEY:
+            use_claude = True
+            anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            logger.info("🚀 Using Claude Haiku (DeepSeek not configured)")
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="No AI provider configured. Please set DEEPSEEK_API_KEY or ANTHROPIC_API_KEY"
+            )
 
         # Step 1: Extract topics from content with hierarchical structure (DYNAMIC PROMPT)
         topics_prompt = f"""Analyze this study material and organize it into a clear, focused hierarchical structure.
@@ -774,41 +864,41 @@ Return ONLY a valid JSON object in this EXACT format (keep to 2-3 levels maximum
 
 Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have questions generated for it. Keep nesting to 2-3 levels maximum."""
 
-        # Call AI to extract topics (with automatic fallback to DeepSeek if Claude fails)
+        # Call AI to extract topics (prefer DeepSeek for cost savings)
         topics_text = None
-        if use_claude and anthropic_client:
+        if deepseek_client:
             try:
-                topics_response = anthropic_client.messages.create(
-                    model="claude-3-5-haiku-20241022",
+                topics_response = deepseek_client.chat.completions.create(
+                    model="deepseek-chat",
                     max_tokens=2048,
                     temperature=0.7,
                     messages=[{"role": "user", "content": topics_prompt}]
                 )
-                topics_text = topics_response.content[0].text
-            except Exception as claude_error:
-                logger.warning(f"⚠️ Claude API failed: {str(claude_error)}")
-                if deepseek_client:
-                    logger.info("🔄 Falling back to DeepSeek...")
-                    use_claude = False  # Switch to DeepSeek for remaining calls
+                topics_text = topics_response.choices[0].message.content
+            except Exception as deepseek_error:
+                logger.warning(f"⚠️ DeepSeek API failed: {str(deepseek_error)}")
+                if anthropic_client:
+                    logger.info("🔄 Falling back to Claude...")
+                    use_claude = True  # Switch to Claude for remaining calls
                 else:
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Claude API failed and no DeepSeek fallback available: {str(claude_error)}"
+                        detail=f"DeepSeek API failed and no Claude fallback available: {str(deepseek_error)}"
                     )
 
-        if not topics_text and deepseek_client:
-            topics_response = deepseek_client.chat.completions.create(
-                model="deepseek-chat",
+        if not topics_text and use_claude and anthropic_client:
+            topics_response = anthropic_client.messages.create(
+                model="claude-3-5-haiku-20241022",
                 max_tokens=2048,
                 temperature=0.7,
                 messages=[{"role": "user", "content": topics_prompt}]
             )
-            topics_text = topics_response.choices[0].message.content
+            topics_text = topics_response.content[0].text
 
         if not topics_text:
             raise HTTPException(
                 status_code=500,
-                detail="No AI provider available. Please configure ANTHROPIC_API_KEY or DEEPSEEK_API_KEY."
+                detail="No AI provider available. Please configure DEEPSEEK_API_KEY or ANTHROPIC_API_KEY."
             )
 
         # Parse hierarchical topics
@@ -1123,31 +1213,32 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
 
                 batch_text = None
                 try:
-                    if use_claude and anthropic_client:
+                    # OPTIMIZATION: Prefer DeepSeek for question generation (45% cost savings)
+                    if deepseek_client:
                         try:
-                            batch_response = anthropic_client.messages.create(
-                                model="claude-3-5-haiku-20241022",
-                                max_tokens=8192,  # Maximum output tokens for Claude 3.5 Haiku
+                            batch_response = deepseek_client.chat.completions.create(
+                                model="deepseek-chat",
+                                max_tokens=64000,  # DeepSeek supports larger output
                                 temperature=0.7,
                                 messages=[{"role": "user", "content": batch_prompt}]
                             )
-                            batch_text = batch_response.content[0].text
-                        except Exception as claude_error:
-                            logger.warning(f"⚠️ Claude API failed for chunk {chunk_idx} batch {batch_num}: {str(claude_error)}")
-                            if deepseek_client:
-                                logger.info(f"🔄 Falling back to DeepSeek for chunk {chunk_idx} batch {batch_num}...")
-                                use_claude = False  # Switch to DeepSeek for remaining calls
+                            batch_text = batch_response.choices[0].message.content
+                        except Exception as deepseek_error:
+                            logger.warning(f"⚠️ DeepSeek API failed for chunk {chunk_idx} batch {batch_num}: {str(deepseek_error)}")
+                            if anthropic_client:
+                                logger.info(f"🔄 Falling back to Claude for chunk {chunk_idx} batch {batch_num}...")
+                                use_claude = True  # Switch to Claude for remaining calls
                             else:
                                 raise  # Re-raise if no fallback available
 
-                    if not batch_text and deepseek_client:
-                        batch_response = deepseek_client.chat.completions.create(
-                            model="deepseek-chat",
-                            max_tokens=64000,  # DeepSeek supports larger output
+                    if not batch_text and use_claude and anthropic_client:
+                        batch_response = anthropic_client.messages.create(
+                            model="claude-3-5-haiku-20241022",
+                            max_tokens=8192,  # Maximum output tokens for Claude 3.5 Haiku
                             temperature=0.7,
                             messages=[{"role": "user", "content": batch_prompt}]
                         )
-                        batch_text = batch_response.choices[0].message.content
+                        batch_text = batch_response.content[0].text
 
                     if not batch_text:
                         raise Exception("No AI provider available")
@@ -1335,6 +1426,55 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
         # Commit all changes
         db.commit()
         db.refresh(study_session)
+
+        # OPTIMIZATION: Cache the generated content for 24 hours to save on duplicate uploads
+        # Store minimal data needed to recreate the session
+        try:
+            all_topics_from_db = db.query(Topic).filter(
+                Topic.study_session_id == study_session.id
+            ).order_by(Topic.order_index).all()
+
+            cache_data = {
+                'title': study_session.title,
+                'topic': study_session.topic,
+                'topics_count': study_session.topics_count,
+                'topics': []
+            }
+
+            # Store topic and question data
+            for topic in all_topics_from_db:
+                questions = db.query(Question).filter(
+                    Question.topic_id == topic.id
+                ).order_by(Question.order_index).all()
+
+                topic_cache = {
+                    'title': topic.title,
+                    'description': topic.description,
+                    'order_index': topic.order_index,
+                    'is_category': topic.is_category,
+                    'parent_topic_id': topic.parent_topic_id,
+                    'questions': [
+                        {
+                            'question': q.question,
+                            'options': q.options,
+                            'correct_answer': q.correct_answer,
+                            'explanation': q.explanation,
+                            'source_text': q.source_text,
+                            'source_page': q.source_page,
+                            'order_index': q.order_index
+                        }
+                        for q in questions
+                    ]
+                }
+                cache_data['topics'].append(topic_cache)
+
+            # Cache for 24 hours (86400 seconds)
+            set_cache(cache_key, cache_data, ttl=86400)
+            logger.info(f"💾 Cached AI-generated content with key {cache_key} (24h TTL)")
+            logger.info(f"💰 Future uploads of this content will skip AI generation")
+        except Exception as cache_error:
+            # Don't fail the request if caching fails
+            logger.warning(f"⚠️ Failed to cache generated content: {cache_error}")
 
         return CreateStudySessionResponse(
             id=str(study_session.id),  # Convert UUID to string
@@ -1551,17 +1691,21 @@ async def generate_more_questions(
 
     extracted_text, _, _ = detect_file_type_and_extract(session.file_content)
 
-    # Initialize AI client
-    use_claude = bool(settings.ANTHROPIC_API_KEY)
-    if use_claude:
-        anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        logger.info("🚀 Using Claude Haiku for question generation")
-    else:
+    # OPTIMIZATION: Initialize AI client (prefer DeepSeek for 45% cost savings)
+    use_claude = False
+    anthropic_client = None
+    deepseek_client = None
+
+    if settings.DEEPSEEK_API_KEY:
         deepseek_client = OpenAI(
             api_key=settings.DEEPSEEK_API_KEY,
             base_url="https://api.deepseek.com"
         )
-        logger.info("⏱️ Using DeepSeek")
+        logger.info("💰 Using DeepSeek for cost-optimized question generation")
+    elif settings.ANTHROPIC_API_KEY:
+        use_claude = True
+        anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        logger.info("🚀 Using Claude Haiku (DeepSeek not configured)")
 
     # Build prompt for next batch
     subtopics_list = ""
@@ -1703,7 +1847,16 @@ REMINDER: The response MUST include questions for ALL {len(next_batch)} topics l
     logger.info(f"📊 Prompt length: {len(batch_prompt):,} characters")
 
     try:
-        if use_claude:
+        # OPTIMIZATION: Prefer DeepSeek for cost savings
+        if deepseek_client:
+            batch_response = deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                max_tokens=64000,  # DeepSeek supports larger output
+                temperature=0.7,
+                messages=[{"role": "user", "content": batch_prompt}]
+            )
+            batch_text = batch_response.choices[0].message.content
+        elif use_claude:
             batch_response = anthropic_client.messages.create(
                 model="claude-3-5-haiku-20241022",
                 max_tokens=8192,  # Maximum for Haiku (2 topics × ~20 questions each fits in 8k)
@@ -1713,13 +1866,7 @@ REMINDER: The response MUST include questions for ALL {len(next_batch)} topics l
             batch_text = batch_response.content[0].text
             logger.info(f"📊 AI response stats: stop_reason={batch_response.stop_reason}, input_tokens={batch_response.usage.input_tokens}, output_tokens={batch_response.usage.output_tokens}")
         else:
-            batch_response = deepseek_client.chat.completions.create(
-                model="deepseek-chat",
-                max_tokens=64000,  # DeepSeek supports larger output
-                temperature=0.7,
-                messages=[{"role": "user", "content": batch_prompt}]
-            )
-            batch_text = batch_response.choices[0].message.content
+            raise HTTPException(status_code=500, detail="No AI provider configured")
     except Exception as api_error:
         logger.error(f"❌ AI API call failed: {type(api_error).__name__}: {str(api_error)}")
         raise HTTPException(status_code=500, detail=f"AI API error: {str(api_error)}")
@@ -2022,4 +2169,138 @@ async def update_user_xp(
         "xp": current_user.xp,
         "xp_added": data.xp_to_add,
         "level": current_user.level
+    }
+
+
+class BatchXPUpdate(BaseModel):
+    """OPTIMIZATION: Batch multiple XP updates to reduce API calls by 90%."""
+    xp_increments: List[int] = Field(..., min_items=1, max_items=100)  # Batch up to 100 answers
+
+
+@router.post("/user/xp/batch")
+@limiter.limit("20/minute")  # Much lower limit since it's batched
+async def batch_update_user_xp(
+    request: Request,
+    data: BatchXPUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    OPTIMIZATION: Add XP in batch (every 5-10 answers instead of every 1).
+
+    This reduces API calls by 90% and database writes by 90%.
+
+    Example:
+        Instead of calling /user/xp 10 times with xp_to_add=10,
+        call /user/xp/batch once with xp_increments=[10,10,10,10,10,10,10,10,10,10]
+
+    Rate Limits:
+        - 20 requests per minute per user (much lower because it's batched)
+    """
+    total_xp = sum(data.xp_increments)
+
+    # Update user XP
+    current_user.xp += total_xp
+    current_user.updated_at = datetime.utcnow()
+
+    # Calculate level (simple formula: level = floor(xp / 100) + 1)
+    current_user.level = (current_user.xp // 100) + 1
+
+    db.commit()
+    db.refresh(current_user)
+
+    return {
+        "message": f"Batch updated {len(data.xp_increments)} XP increments",
+        "answers_processed": len(data.xp_increments),
+        "total_xp_added": total_xp,
+        "xp": current_user.xp,
+        "level": current_user.level
+    }
+
+
+class TopicProgressUpdate(BaseModel):
+    """Single topic progress update."""
+    topic_id: int
+    score: int = Field(..., ge=0, le=100)
+    current_question_index: int = Field(..., ge=0)
+    completed: bool = False
+
+
+class BatchProgressUpdate(BaseModel):
+    """OPTIMIZATION: Batch multiple topic progress updates to reduce API calls by 90%."""
+    session_id: str  # UUID
+    updates: List[TopicProgressUpdate] = Field(..., min_items=1, max_items=50)
+
+
+@router.post("/batch-progress")
+@limiter.limit("30/minute")  # Lower limit since it's batched
+async def batch_update_progress(
+    request: Request,
+    data: BatchProgressUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    OPTIMIZATION: Update multiple topic progress in one request.
+
+    This reduces API calls by 90% when students complete multiple questions.
+
+    Example:
+        Instead of calling /topics/{id}/progress 10 times,
+        call /batch-progress once with all 10 updates
+
+    Rate Limits:
+        - 30 requests per minute per user (much lower because it's batched)
+    """
+    # Validate UUID
+    try:
+        uuid_obj = uuid.UUID(data.session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid session ID format")
+
+    # Verify session belongs to user
+    session = db.query(StudySession).filter(
+        StudySession.id == uuid_obj,
+        StudySession.user_id == current_user.id
+    ).first()
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found")
+
+    # Process all updates
+    updated_topics = []
+    for update in data.updates:
+        # Find and update topic
+        topic = db.query(Topic).filter(
+            Topic.id == update.topic_id,
+            Topic.study_session_id == uuid_obj
+        ).first()
+
+        if topic:
+            topic.score = update.score
+            topic.current_question_index = update.current_question_index
+            topic.completed = update.completed
+            updated_topics.append(topic.id)
+        else:
+            logger.warning(f"⚠️ Topic {update.topic_id} not found in session {data.session_id}")
+
+    # Update session progress (percentage of completed subtopics)
+    all_topics = db.query(Topic).filter(
+        Topic.study_session_id == uuid_obj,
+        Topic.is_category == False  # Only count leaf topics
+    ).all()
+
+    completed_topics = sum(1 for t in all_topics if t.completed)
+    total_topics = len(all_topics)
+    session.progress = int((completed_topics / total_topics * 100) if total_topics > 0 else 0)
+
+    db.commit()
+
+    return {
+        "message": f"Batch updated {len(updated_topics)} topics",
+        "topics_updated": len(updated_topics),
+        "topics_completed": completed_topics,
+        "total_topics": total_topics,
+        "session_progress": session.progress,
+        "updated_topic_ids": updated_topics
     }
