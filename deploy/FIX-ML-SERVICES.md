@@ -139,6 +139,30 @@ ResourceNotFoundException: Secrets Manager can't find the specified secret
 
 See **[SECRETS-SETUP.md](./SECRETS-SETUP.md)** for detailed instructions on creating and managing secrets.
 
+## Common Follow-Up Issue: Database Connection Errors
+
+After all secrets are created, tasks may start but crash immediately with:
+
+```
+sqlalchemy.exc.OperationalError: could not translate host name "DB_HOST" to address: Name or service not known
+```
+
+**Cause**: The `DATABASE_URL` environment variable still has placeholder values (`DB_HOST`, `DB_USER`, `DB_PASS`) instead of actual database connection details.
+
+### Quick fix:
+
+```bash
+./fix-database-config.sh
+```
+
+This script will:
+- Auto-detect your RDS database and Redis endpoints
+- Prompt for database password (or use saved password)
+- Update task definition with real connection strings
+- Deploy the fixed configuration
+
+The script will ask for your database password. If you don't have it saved, you'll need to enter it manually.
+
 ## Troubleshooting
 
 ### If ML service IP is not found:
