@@ -7,5 +7,6 @@ from app.models.study_session import StudySession
 from app.models.topic import Topic
 from app.models.question import Question
 from app.models.folder import Folder
+from app.models.flashcard import Flashcard
 
-__all__ = ["User", "Game", "StudySession", "Topic", "Question", "Folder"]
+__all__ = ["User", "Game", "StudySession", "Topic", "Question", "Folder", "Flashcard"]

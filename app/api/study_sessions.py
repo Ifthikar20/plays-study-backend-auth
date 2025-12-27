@@ -28,6 +28,7 @@ from app.models.user import User
 from app.models.study_session import StudySession
 from app.models.topic import Topic
 from app.models.question import Question
+from app.models.flashcard import Flashcard
 from app.core.rate_limit import limiter
 from app.core.cache import get_cache, set_cache
 
@@ -742,6 +743,17 @@ async def create_study_session_with_ai(
                     )
                     db.add(question)
 
+                # Add flashcards for this topic (NEW: workflow feature)
+                for f_data in topic_data.get('flashcards', []):
+                    flashcard = Flashcard(
+                        topic_id=topic.id,
+                        front=f_data['front'],
+                        back=f_data['back'],
+                        hint=f_data.get('hint'),
+                        order_index=f_data['order_index']
+                    )
+                    db.add(flashcard)
+
             db.commit()
             db.refresh(study_session)
 
@@ -1086,11 +1098,12 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
                     subtopics_list += f"Type: {'CATEGORY (overview/synthesis questions)' if is_category else 'SPECIFIC TOPIC (detailed questions)'}\n"
 
                 # Build prompt for this chunk and subtopic batch
-                batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions for EACH of the following topics from the study material.
+                batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions AND flashcards for EACH of the following topics from the study material.
 
-CRITICAL: Generate high-quality, comprehensive questions:
+CRITICAL: Generate high-quality, comprehensive questions AND flashcards:
 - Extract the MOST IMPORTANT testable concepts, facts, principles, definitions, and examples from the material
 - Aim for 15-20 high-quality questions per topic (quality over quantity)
+- Generate 3-5 flashcards per topic for post-quiz review (spaced repetition learning)
 - Break down key concepts into multiple questions from different angles
 - Test each concept in multiple ways: definition, application, comparison, analysis, synthesis, evaluation
 - Create questions for the most important content in the study material
@@ -1165,11 +1178,20 @@ IMPORTANT INSTRUCTIONS:
 
 GOAL: Create 15-20 comprehensive questions per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
 
+FLASHCARD REQUIREMENTS:
+- Generate 3-5 flashcards per topic for post-quiz review
+- Flashcards should cover KEY DEFINITIONS, CONCEPTS, and TERMS
+- Front: Question or term (concise, clear)
+- Back: Answer or definition (comprehensive but digestible)
+- Hint: Optional memory aid or mnemonic (can be null)
+- Flashcards complement questions - focus on memorization and quick recall
+- Use flashcards for: definitions, formulas, key facts, important dates, terminology
+
 CRITICAL REQUIREMENTS:
-- You MUST generate questions for EVERY SINGLE topic key listed above - NO EXCEPTIONS
-- If a topic is listed, it MUST appear in your JSON response with questions
+- You MUST generate questions AND flashcards for EVERY SINGLE topic key listed above - NO EXCEPTIONS
+- If a topic is listed, it MUST appear in your JSON response with questions AND flashcards
 - Missing even ONE topic key will result in incomplete learning coverage
-- Each topic MUST have 15-20 questions (aim for 20 when possible)
+- Each topic MUST have 15-20 questions (aim for 20 when possible) AND 3-5 flashcards
 
 Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic listed must be in the response):
 {{
@@ -1185,12 +1207,24 @@ Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic
           "sourcePage": null
         }},
         ... (10-30+ questions for topic "0")
+      ],
+      "flashcards": [
+        {{
+          "front": "What is the definition of X?",
+          "back": "X is defined as...",
+          "hint": "Remember: X starts with..."
+        }},
+        ... (3-5 flashcards for topic "0")
       ]
     }},
     "0-1": {{
       "questions": [
         {{question object}},
         ... (10-30+ questions for topic "0-1")
+      ],
+      "flashcards": [
+        {{flashcard object}},
+        ... (3-5 flashcards for topic "0-1")
       ]
     }},
     ... (MUST include ALL topic keys from the list above)
@@ -1271,8 +1305,9 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
                         logger.info(f"    ✅ Batch {batch_num} - Parsed {len(chunk_questions)} subtopics")
                         for key in chunk_questions.keys():
                             q_count = len(chunk_questions[key].get("questions", []))
+                            f_count = len(chunk_questions[key].get("flashcards", []))
                             if q_count > 0:
-                                logger.info(f"      - Subtopic {key}: {q_count} questions")
+                                logger.info(f"      - Subtopic {key}: {q_count} questions, {f_count} flashcards")
 
                         # Validate that ALL topics in this batch got questions
                         missing_topics = [key for key in batch_keys if key not in chunk_questions or not chunk_questions[key].get("questions")]
@@ -1286,22 +1321,26 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
                     logger.error(f"❌ Chunk {chunk_idx} Batch {batch_num} - Failed to parse questions: {e}")
                     chunk_questions = {}
 
-                # Merge questions from this batch into all_chunk_questions
+                # Merge questions and flashcards from this batch into all_chunk_questions
                 for subtopic_key, subtopic_data in chunk_questions.items():
                     questions = subtopic_data.get("questions", [])
+                    flashcards = subtopic_data.get("flashcards", [])
                     if questions:
                         if subtopic_key not in all_chunk_questions:
-                            all_chunk_questions[subtopic_key] = []
-                        all_chunk_questions[subtopic_key].extend(questions)
-                        logger.debug(f"    🔄 Added {len(questions)} questions for subtopic {subtopic_key}")
+                            all_chunk_questions[subtopic_key] = {"questions": [], "flashcards": []}
+                        all_chunk_questions[subtopic_key]["questions"].extend(questions)
+                        all_chunk_questions[subtopic_key]["flashcards"].extend(flashcards)
+                        logger.debug(f"    🔄 Added {len(questions)} questions and {len(flashcards)} flashcards for subtopic {subtopic_key}")
 
         # Log merged results
         logger.info(f"🎯 Merging complete - Total subtopics with questions: {len(all_chunk_questions)}")
-        for key, questions in all_chunk_questions.items():
-            logger.info(f"  - Subtopic {key}: {len(questions)} total questions from all chunks")
+        for key, data in all_chunk_questions.items():
+            q_count = len(data.get("questions", []))
+            f_count = len(data.get("flashcards", []))
+            logger.info(f"  - Subtopic {key}: {q_count} total questions, {f_count} total flashcards from all chunks")
 
-        # Use merged questions as the final subtopics_questions
-        subtopics_questions = {key: {"questions": questions} for key, questions in all_chunk_questions.items()}
+        # Use merged questions and flashcards as the final subtopics_questions
+        subtopics_questions = all_chunk_questions
 
         # Step 5: Assign questions to subtopics
         question_counter = 0
@@ -1384,6 +1423,20 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
             if duplicates_skipped > 0:
                 logger.info(f"  ⏭️ Skipped {duplicates_skipped} duplicate questions for '{subtopic.title}'")
 
+            # Save flashcards to database (NEW: workflow feature)
+            flashcards_data = subtopics_questions.get(subtopic_key, {}).get("flashcards", [])
+            if flashcards_data:
+                logger.info(f"💳 Saving {len(flashcards_data)} flashcards for subtopic '{subtopic.title}'")
+                for f_idx, f_data in enumerate(flashcards_data):
+                    flashcard = Flashcard(
+                        topic_id=subtopic.id,
+                        front=f_data.get("front", ""),
+                        back=f_data.get("back", ""),
+                        hint=f_data.get("hint"),
+                        order_index=f_idx
+                    )
+                    db.add(flashcard)
+
             # Update subtopic schema with questions
             subtopic_schema.questions = questions_list
             # Add to parent (either category or parent subtopic)
@@ -1435,11 +1488,15 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
                 'topics': []
             }
 
-            # Store topic and question data
+            # Store topic, question, and flashcard data
             for topic in all_topics_from_db:
                 questions = db.query(Question).filter(
                     Question.topic_id == topic.id
                 ).order_by(Question.order_index).all()
+
+                flashcards = db.query(Flashcard).filter(
+                    Flashcard.topic_id == topic.id
+                ).order_by(Flashcard.order_index).all()
 
                 topic_cache = {
                     'title': topic.title,
@@ -1458,6 +1515,15 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
                             'order_index': q.order_index
                         }
                         for q in questions
+                    ],
+                    'flashcards': [
+                        {
+                            'front': f.front,
+                            'back': f.back,
+                            'hint': f.hint,
+                            'order_index': f.order_index
+                        }
+                        for f in flashcards
                     ]
                 }
                 cache_data['topics'].append(topic_cache)
@@ -2290,4 +2356,194 @@ async def batch_update_progress(
         "total_topics": total_topics,
         "session_progress": session.progress,
         "updated_topic_ids": updated_topics
+    }
+
+
+# ===== FLASHCARD ENDPOINTS (Workflow Feature) =====
+
+@router.get("/topics/{topic_id}/flashcards")
+async def get_topic_flashcards(
+    topic_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Get all flashcards for a topic (for post-quiz review).
+
+    This endpoint returns flashcards that should be reviewed AFTER
+    completing the quiz for a topic. Flashcards use spaced repetition
+    for long-term memorization.
+
+    Returns:
+        List of flashcards with spaced repetition metadata
+    """
+    # Verify topic exists and belongs to user's session
+    topic = db.query(Topic).join(StudySession).filter(
+        Topic.id == topic_id,
+        StudySession.user_id == current_user.id
+    ).first()
+
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+    # Get all flashcards for this topic
+    flashcards = db.query(Flashcard).filter(
+        Flashcard.topic_id == topic_id
+    ).order_by(Flashcard.order_index).all()
+
+    return {
+        "topic_id": topic_id,
+        "topic_title": topic.title,
+        "flashcards": [
+            {
+                "id": f.id,
+                "front": f.front,
+                "back": f.back,
+                "hint": f.hint,
+                "order_index": f.order_index,
+                "ease_factor": f.ease_factor,
+                "interval_days": f.interval_days,
+                "repetitions": f.repetitions,
+                "next_review_date": f.next_review_date.isoformat() if f.next_review_date else None,
+                "last_reviewed_at": f.last_reviewed_at.isoformat() if f.last_reviewed_at else None,
+                "total_reviews": f.total_reviews,
+                "correct_reviews": f.correct_reviews,
+                "accuracy": f.get_accuracy(),
+                "is_due": f.is_due_for_review()
+            }
+            for f in flashcards
+        ],
+        "total_flashcards": len(flashcards),
+        "due_for_review": sum(1 for f in flashcards if f.is_due_for_review())
+    }
+
+
+class FlashcardReviewRequest(BaseModel):
+    """Request schema for submitting a flashcard review."""
+    quality: int = Field(..., ge=0, le=5, description="Rating 0-5 (0=failed, 3=hard, 4=good, 5=easy)")
+
+
+@router.post("/flashcards/{flashcard_id}/review")
+async def submit_flashcard_review(
+    flashcard_id: int,
+    data: FlashcardReviewRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Submit a review for a flashcard (updates spaced repetition algorithm).
+
+    Quality ratings:
+    - 0-2: Failed (card will be shown again soon)
+    - 3: Hard (passed but difficult)
+    - 4: Good (passed with some effort)
+    - 5: Easy (passed easily)
+
+    The algorithm automatically calculates the next review date based
+    on your performance (SM-2 spaced repetition algorithm).
+
+    Returns:
+        Updated flashcard with new review schedule
+    """
+    # Verify flashcard exists and belongs to user's session
+    flashcard = db.query(Flashcard).join(Topic).join(StudySession).filter(
+        Flashcard.id == flashcard_id,
+        StudySession.user_id == current_user.id
+    ).first()
+
+    if not flashcard:
+        raise HTTPException(status_code=404, detail="Flashcard not found")
+
+    # Update spaced repetition data
+    flashcard.calculate_next_review(data.quality)
+
+    db.commit()
+    db.refresh(flashcard)
+
+    return {
+        "flashcard_id": flashcard.id,
+        "quality": data.quality,
+        "next_review_date": flashcard.next_review_date.isoformat() if flashcard.next_review_date else None,
+        "interval_days": flashcard.interval_days,
+        "ease_factor": flashcard.ease_factor,
+        "repetitions": flashcard.repetitions,
+        "total_reviews": flashcard.total_reviews,
+        "correct_reviews": flashcard.correct_reviews,
+        "accuracy": flashcard.get_accuracy()
+    }
+
+
+# ===== WORKFLOW VISUALIZATION ENDPOINT =====
+
+@router.get("/sessions/{session_id}/workflow")
+async def get_session_workflow(
+    session_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Get workflow visualization data for a study session.
+
+    Returns topic hierarchy with:
+    - Position coordinates (for skill-tree UI)
+    - Workflow stages (locked, quiz_available, quiz_completed, flashcard_review, completed)
+    - Prerequisites and dependencies
+    - Question and flashcard counts
+    - Progress tracking
+
+    This data is used by the frontend to render a visual skill-tree
+    showing the user's learning path and progress.
+    """
+    # Validate UUID
+    try:
+        uuid_obj = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid session ID format")
+
+    # Verify session belongs to user
+    session = db.query(StudySession).filter(
+        StudySession.id == uuid_obj,
+        StudySession.user_id == current_user.id
+    ).first()
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Study session not found")
+
+    # Get all topics with question and flashcard counts
+    topics = db.query(
+        Topic,
+        func.count(Question.id.distinct()).label('question_count'),
+        func.count(Flashcard.id.distinct()).label('flashcard_count')
+    ).outerjoin(Question).outerjoin(Flashcard).filter(
+        Topic.study_session_id == uuid_obj
+    ).group_by(Topic.id).all()
+
+    # Build workflow nodes
+    workflow_nodes = []
+    for topic, question_count, flashcard_count in topics:
+        node = {
+            "topic_id": topic.id,
+            "title": topic.title,
+            "description": topic.description,
+            "is_category": topic.is_category,
+            "parent_topic_id": topic.parent_topic_id,
+            "order_index": topic.order_index,
+            "workflow_stage": topic.workflow_stage or "locked",
+            "position_x": topic.position_x,
+            "position_y": topic.position_y,
+            "prerequisite_topic_ids": topic.prerequisite_topic_ids or [],
+            "question_count": question_count,
+            "flashcard_count": flashcard_count,
+            "completed": topic.completed,
+            "score": topic.score,
+            "current_question_index": topic.current_question_index
+        }
+        workflow_nodes.append(node)
+
+    return {
+        "session_id": str(session.id),
+        "title": session.title,
+        "progress": session.progress,
+        "workflow_nodes": workflow_nodes,
+        "total_nodes": len(workflow_nodes)
     }
