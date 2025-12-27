@@ -1,11 +1,16 @@
 # AI Cost Optimization Changes
 
 ## Summary
-Implemented comprehensive AI API cost optimizations that reduce monthly costs by **$180-450 (40-70% reduction)** while maintaining full functionality.
+Implemented comprehensive AI API cost optimizations that reduce monthly costs by **$170-340 (35-60% reduction)** while maintaining full functionality and using Claude Haiku for quality.
 
-## Important Note
+## Important Notes
 
-**BUG FIX (2025-12-27)**: Initial implementation incorrectly set DeepSeek `max_tokens=64000`. DeepSeek's actual limit is **8,192 tokens**. This has been corrected in commit 57ea84a. All DeepSeek calls now use the correct `max_tokens=8192` value.
+**BUG FIX (2025-12-27)**: Initial implementation incorrectly set DeepSeek `max_tokens=64000`. DeepSeek's actual limit is **8,192 tokens**. This has been corrected in commit 57ea84a.
+
+**AI PROVIDER CHANGE (2025-12-27)**: Switched back to **Claude Haiku as primary** AI provider (commit 38e471c). DeepSeek is now fallback only. This change was made per user preference for Claude's speed and quality. Cost savings now come primarily from:
+1. Reduced questions (15 vs 50 per topic) = 70% reduction
+2. Content caching (24h TTL) = 100% savings on duplicates
+3. Batch endpoints = 90% fewer API calls
 
 ## Changes Made
 
@@ -51,20 +56,19 @@ questions_per_topic: int = Field(default=15, ge=5, le=100)  # OPTIMIZED: 40% cos
 💰 Cost savings: Skipped 4 topics × 15 questions AI generation
 ```
 
-### 3. Prefer DeepSeek Over Claude ✅
-**Files**: `app/api/study_sessions.py:788-810, 867-902, 1216-1244, 1694-1708, 1850-1869`
+### 3. Claude Haiku as Primary (DeepSeek Fallback) ✅
+**Files**: `app/api/study_sessions.py:788-810, 861-896, 1208-1237, 1687-1697, 1838-1855`
 
 **Changes**:
-- DeepSeek is now primary AI provider (when available)
-- Claude Haiku is fallback
-- Both have automatic failover
-- **Cost Impact**: 45% reduction per AI call
-- **Savings**: ~$30-50/month
+- Claude Haiku is PRIMARY AI provider
+- DeepSeek is FALLBACK (automatic failover)
+- Both providers fully integrated with error recovery
+- **Focus**: Speed and quality over cost per call
+- **Note**: Overall cost savings still achieved through question reduction and caching
 
-**Pricing Comparison**:
-- DeepSeek: $0.14 per 1M input tokens
-- Claude Haiku: $0.25 per 1M input tokens
-- **Savings**: 45% cheaper per call
+**Pricing Context**:
+- Claude Haiku: $0.25 per 1M input tokens (faster, higher quality)
+- DeepSeek: $0.14 per 1M input tokens (45% cheaper, fallback only)
 
 **Affected Endpoints**:
 - Topic extraction (study session creation)
@@ -154,10 +158,12 @@ POST /api/v1/study-sessions/batch-progress
 |--------------|-----------------|---------------------|------|
 | Reduce default questions | $100-200 | 5 min | None |
 | Content caching | $50-100 | 1 hour | Low |
-| Prefer DeepSeek | $30-50 | 30 min | Low |
+| Claude (with fallback) | $0 (quality focus) | 30 min | Low |
 | Batch XP updates | $10-20 | 1 hour | None |
 | Batch progress updates | $10-20 | 1 hour | None |
-| **TOTAL** | **$200-390** | **3.5 hours** | **Low** |
+| **TOTAL** | **$170-340** | **3.5 hours** | **Low** |
+
+**Note**: Primary cost savings come from reduced questions and caching, not cheaper AI provider.
 
 ## Additional Benefits
 
@@ -268,9 +274,10 @@ class StudySessionManager {
    Target: 20-30% hit rate
    ```
 
-2. **Cost Reduction**:
-   - Monitor DeepSeek vs Claude usage in CloudWatch logs
-   - Track "Using DeepSeek for cost-optimized generation" messages
+2. **AI Provider Usage**:
+   - Monitor Claude vs DeepSeek usage in CloudWatch logs
+   - Track "Using Claude Haiku for fast generation" messages
+   - Monitor DeepSeek fallback activations
 
 3. **Batch Adoption**:
    - Compare call counts: `/user/xp` vs `/user/xp/batch`
@@ -286,7 +293,7 @@ fields @timestamp, @message
 
 -- AI provider usage
 fields @timestamp, @message
-| filter @message like /Using DeepSeek/ or @message like /Using Claude/
+| filter @message like /Using Claude/ or @message like /Falling back to DeepSeek/
 | stats count() by @message
 
 -- Batch usage
