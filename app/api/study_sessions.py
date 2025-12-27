@@ -1388,8 +1388,8 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
         for subtopic_key, subtopic_info in subtopic_map.items():
             subtopic = subtopic_info["topic"]
             subtopic_schema = subtopic_info["schema"]
-            # Get parent schema (either category_schema or subtopic_schema)
-            parent_schema = subtopic_info.get("category_schema") or subtopic_info.get("subtopic_schema")
+            # Get parent schema (category or parent subtopic)
+            parent_schema = subtopic_info.get("parent_schema")
 
             # Get questions for this subtopic from batch response
             questions_data = subtopics_questions.get(subtopic_key, {}).get("questions", [])
