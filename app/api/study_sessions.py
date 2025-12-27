@@ -1207,11 +1207,16 @@ JSON FORMATTING RULES (CRITICAL):
 - Do NOT include comments in the JSON
 
 IMPORTANT INSTRUCTIONS:
-- Do NOT ask clarifying questions
-- Do NOT say "I understand" or provide explanations
-- Do NOT add any text before or after the JSON
-- START your response IMMEDIATELY with the opening brace: {{
-- Generate the complete JSON response now
+- DO NOT ASK ANY QUESTIONS - you have all the information you need
+- DO NOT SAY "I understand" or "I'll help" or provide ANY explanations
+- DO NOT ADD ANY TEXT before or after the JSON
+- YOUR FIRST CHARACTER MUST BE: {{
+- YOUR LAST CHARACTER MUST BE: }}
+- OUTPUT ONLY THE JSON OBJECT - NOTHING ELSE
+
+YOU MUST START YOUR RESPONSE WITH THIS EXACT CHARACTER: {{
+
+Begin JSON output now:
 
 GOAL: Create 25-35 comprehensive questions per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
 
@@ -1281,13 +1286,18 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
                 try:
                     if use_claude and anthropic_client:
                         try:
+                            # Use prefill technique to force JSON response (prevents conversational responses)
                             batch_response = anthropic_client.messages.create(
                                 model="claude-3-5-haiku-20241022",
                                 max_tokens=8192,  # Maximum output tokens for Claude 3.5 Haiku
                                 temperature=0.7,
-                                messages=[{"role": "user", "content": batch_prompt}]
+                                messages=[
+                                    {"role": "user", "content": batch_prompt},
+                                    {"role": "assistant", "content": "{"}  # Prefill with opening brace to force JSON
+                                ]
                             )
-                            batch_text = batch_response.content[0].text
+                            # Prepend the opening brace since it was in the prefill
+                            batch_text = "{" + batch_response.content[0].text
                         except Exception as claude_error:
                             logger.warning(f"⚠️ Claude API failed for chunk {chunk_idx} batch {batch_num}: {str(claude_error)}")
                             if deepseek_client:
@@ -1904,11 +1914,16 @@ JSON FORMATTING RULES (CRITICAL):
 - Do NOT include comments in the JSON
 
 IMPORTANT INSTRUCTIONS:
-- Do NOT ask clarifying questions
-- Do NOT say "I understand" or provide explanations
-- Do NOT add any text before or after the JSON
-- START your response IMMEDIATELY with the opening brace: {{
-- Generate the complete JSON response now
+- DO NOT ASK ANY QUESTIONS - you have all the information you need
+- DO NOT SAY "I understand" or "I'll help" or provide ANY explanations
+- DO NOT ADD ANY TEXT before or after the JSON
+- YOUR FIRST CHARACTER MUST BE: {{
+- YOUR LAST CHARACTER MUST BE: }}
+- OUTPUT ONLY THE JSON OBJECT - NOTHING ELSE
+
+YOU MUST START YOUR RESPONSE WITH THIS EXACT CHARACTER: {{
+
+Begin JSON output now:
 
 GOAL: Create 25-35 comprehensive questions AND 10-15 flashcards per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
 
@@ -1971,13 +1986,18 @@ REMINDER: The response MUST include questions AND flashcards for ALL {len(next_b
 
     try:
         if use_claude:
+            # Use prefill technique to force JSON response (prevents conversational responses)
             batch_response = anthropic_client.messages.create(
                 model="claude-3-5-haiku-20241022",
                 max_tokens=8192,  # Maximum for Haiku (2 topics × ~20 questions each fits in 8k)
                 temperature=0.7,
-                messages=[{"role": "user", "content": batch_prompt}]
+                messages=[
+                    {"role": "user", "content": batch_prompt},
+                    {"role": "assistant", "content": "{"}  # Prefill with opening brace to force JSON
+                ]
             )
-            batch_text = batch_response.content[0].text
+            # Prepend the opening brace since it was in the prefill
+            batch_text = "{" + batch_response.content[0].text
             logger.info(f"📊 AI response stats: stop_reason={batch_response.stop_reason}, input_tokens={batch_response.usage.input_tokens}, output_tokens={batch_response.usage.output_tokens}")
         else:
             batch_response = deepseek_client.chat.completions.create(
