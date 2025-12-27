@@ -2,8 +2,9 @@
 Study Sessions API endpoints with AI content processing.
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, AsyncGenerator
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime
@@ -18,6 +19,7 @@ import tempfile
 import subprocess
 import os
 import hashlib
+import asyncio
 from docx import Document
 from PyPDF2 import PdfReader
 from pptx import Presentation
@@ -2136,6 +2138,304 @@ REMINDER: The response MUST include questions AND flashcards for ALL {len(next_b
         "remaining": remaining_count,
         "hasMore": remaining_count > 0
     }
+
+
+@router.get("/{session_id}/generate-more-questions-stream")
+async def generate_more_questions_stream(
+    session_id: str,
+    token: str,  # Token from query param (EventSource doesn't support headers)
+    db: Session = Depends(get_db),
+):
+    """
+    Stream question generation progress using Server-Sent Events (SSE).
+
+    This endpoint streams real-time progress updates as questions are generated
+    for remaining topics without questions. Uses DeepSeek API exclusively for
+    cost optimization.
+
+    SSE Events:
+    - start: Initial connection with total topics remaining
+    - batch_start: Before each batch generation
+    - progress: After each batch completes (with detailed stats)
+    - complete: When all questions are generated
+    - error: If any error occurs
+    """
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        """Generate Server-Sent Events as questions are created"""
+
+        try:
+            # Authenticate user from token (EventSource doesn't support headers)
+            from app.core.security import decode_access_token
+
+            try:
+                payload = decode_access_token(token)
+                user_id = int(payload.get("sub"))
+
+                current_user = db.query(User).filter(User.id == user_id).first()
+                if not current_user or not current_user.is_active:
+                    yield f"event: error\ndata: {json.dumps({'error': 'Authentication failed'})}\n\n"
+                    return
+            except Exception as auth_error:
+                logger.error(f"❌ SSE authentication failed: {auth_error}")
+                yield f"event: error\ndata: {json.dumps({'error': 'Invalid authentication token'})}\n\n"
+                return
+
+            # Validate UUID
+            try:
+                uuid_obj = uuid.UUID(session_id)
+            except ValueError:
+                yield f"event: error\ndata: {json.dumps({'error': 'Invalid session ID format'})}\n\n"
+                return
+
+            # Fetch session
+            session = db.query(StudySession).filter(
+                StudySession.id == uuid_obj,
+                StudySession.user_id == current_user.id
+            ).first()
+
+            if not session:
+                yield f"event: error\ndata: {json.dumps({'error': 'Study session not found'})}\n\n"
+                return
+
+            # Find topics without questions (optimized query)
+            question_counts_subquery = db.query(
+                Question.topic_id,
+                func.count(Question.id).label('question_count')
+            ).group_by(Question.topic_id).subquery()
+
+            topics_with_counts = db.query(
+                Topic,
+                func.coalesce(question_counts_subquery.c.question_count, 0).label('question_count')
+            ).outerjoin(
+                question_counts_subquery,
+                Topic.id == question_counts_subquery.c.topic_id
+            ).filter(
+                Topic.study_session_id == uuid_obj
+            ).order_by(Topic.order_index).all()
+
+            subtopics_without_questions = [
+                topic for topic, count in topics_with_counts if count == 0
+            ]
+
+            if not subtopics_without_questions:
+                logger.info(f"✅ All subtopics already have questions for session {session_id}")
+                yield f"event: complete\ndata: {json.dumps({'message': 'All topics already have questions', 'generated': 0, 'remaining': 0})}\n\n"
+                return
+
+            total_remaining = len(subtopics_without_questions)
+            logger.info(f"📊 Found {total_remaining} topics without questions")
+
+            # Send start event
+            yield f"event: start\ndata: {json.dumps({'totalRemaining': total_remaining, 'sessionId': session_id})}\n\n"
+
+            # Extract text from file (needed for AI generation)
+            if not session.file_content:
+                yield f"event: error\ndata: {json.dumps({'error': 'No file content available'})}\n\n"
+                return
+
+            extracted_text, _, _ = detect_file_type_and_extract(session.file_content)
+
+            # Initialize DeepSeek client (ALWAYS use DeepSeek for cost optimization)
+            deepseek_client = OpenAI(
+                api_key=settings.DEEPSEEK_API_KEY,
+                base_url="https://api.deepseek.com"
+            )
+            logger.info("⏱️ Using DeepSeek for incremental question generation (SSE stream)")
+
+            # Generate in batches
+            BATCH_SIZE = 2
+            batch_num = 0
+            total_questions_all_batches = 0
+            total_flashcards_all_batches = 0
+
+            while subtopics_without_questions:
+                next_batch = subtopics_without_questions[:BATCH_SIZE]
+                batch_num += 1
+
+                logger.info(f"🔄 SSE Stream - Batch {batch_num}: Generating for {len(next_batch)} topics")
+
+                # Send batch start event
+                yield f"event: batch_start\ndata: {json.dumps({{'batchNumber': batch_num, 'topicsInBatch': len(next_batch)}})}\n\n"
+
+                # Build prompt for this batch
+                subtopics_list = ""
+                subtopic_map = {}
+
+                for topic in next_batch:
+                    parent = db.query(Topic).filter(Topic.id == topic.parent_topic_id).first()
+                    category_title = parent.title if parent else "General"
+                    key = f"topic-{topic.id}"
+                    subtopic_map[key] = topic
+                    topic_type = "CATEGORY (overview/synthesis questions)" if topic.is_category else "SPECIFIC TOPIC (detailed questions)"
+
+                    subtopics_list += f"\n[Topic {key}]\n"
+                    subtopics_list += f"Title: {topic.title}\n"
+                    subtopics_list += f"Description: {topic.description or ''}\n"
+                    subtopics_list += f"Type: {topic_type}\n"
+                    if parent:
+                        subtopics_list += f"Parent Category: {category_title}\n"
+
+                # Build AI prompt (same as generate-more-questions)
+                batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions AND flashcards for EACH of the following topics from the study material.
+
+CRITICAL: Generate the ABSOLUTE MAXIMUM number of questions and flashcards possible:
+- Extract EVERY testable concept, fact, principle, detail, definition, example, and implication from the material
+- DO NOT impose any limits on the number of questions - generate as many as the content supports (aim for 25-35+ questions per topic)
+- Generate 10-15 flashcards per topic for spaced repetition learning
+
+Study Material:
+{extracted_text[:80000]}
+
+TOPICS TO COVER ({len(next_batch)} topics in this batch):
+{subtopics_list}
+
+Requirements:
+1. Generate 25-35 high-quality questions for EACH topic (total ~50-70 questions for this batch)
+2. Generate 10-15 flashcards for EACH topic for spaced repetition review
+3. Each question must have exactly 4 PLAUSIBLE options
+4. Provide detailed explanations
+5. Include source text from the study material
+6. Return ONLY valid JSON - NO MARKDOWN, NO CODE BLOCKS, NO EXTRA TEXT
+
+IMPORTANT INSTRUCTIONS:
+- DO NOT ASK ANY QUESTIONS - you have all the information you need
+- DO NOT SAY "I understand" or "I'll help" or provide ANY explanations
+- YOUR FIRST CHARACTER MUST BE: {{
+- OUTPUT ONLY THE JSON OBJECT - NOTHING ELSE
+
+Return in this EXACT format:
+{{
+  "subtopics": {{
+    "topic-123": {{
+      "questions": [/* 25-35 questions */],
+      "flashcards": [/* 10-15 flashcards */]
+    }}
+  }}
+}}"""
+
+                try:
+                    # Call DeepSeek API
+                    batch_response = deepseek_client.chat.completions.create(
+                        model="deepseek-chat",
+                        max_tokens=8192,
+                        temperature=0.7,
+                        messages=[{"role": "user", "content": batch_prompt}]
+                    )
+                    batch_text = batch_response.choices[0].message.content
+
+                    # Parse JSON response
+                    start_idx = batch_text.find('{')
+                    end_idx = batch_text.rfind('}') + 1
+
+                    if start_idx == -1 or end_idx == 0:
+                        logger.error(f"❌ No JSON found in AI response")
+                        yield f"event: error\ndata: {json.dumps({{'error': 'AI returned non-JSON response', 'batch': batch_num}})}\n\n"
+                        break
+
+                    json_str = batch_text[start_idx:end_idx]
+                    batch_json = json.loads(json_str)
+                    subtopics_questions = batch_json.get("subtopics", {})
+
+                    # Save questions and flashcards
+                    total_questions_generated = 0
+                    total_flashcards_generated = 0
+
+                    for key, topic in subtopic_map.items():
+                        questions_data = subtopics_questions.get(key, {}).get("questions", [])
+                        flashcards_data = subtopics_questions.get(key, {}).get("flashcards", [])
+
+                        # Save questions
+                        for q_idx, q_data in enumerate(questions_data):
+                            options = q_data.get("options", ["A", "B", "C", "D"])
+                            if isinstance(options, str):
+                                try:
+                                    options = json.loads(options)
+                                except:
+                                    options = ["Option A", "Option B", "Option C", "Option D"]
+
+                            question = Question(
+                                topic_id=topic.id,
+                                question=q_data.get("question", f"Question {q_idx+1}"),
+                                options=options,
+                                correct_answer=q_data.get("correctAnswer", 0),
+                                explanation=q_data.get("explanation", ""),
+                                source_text=q_data.get("sourceText"),
+                                source_page=q_data.get("sourcePage"),
+                                order_index=q_idx
+                            )
+                            db.add(question)
+                            total_questions_generated += 1
+
+                        # Save flashcards
+                        if flashcards_data:
+                            for f_idx, f_data in enumerate(flashcards_data):
+                                flashcard = Flashcard(
+                                    topic_id=topic.id,
+                                    front=f_data.get("front", ""),
+                                    back=f_data.get("back", ""),
+                                    hint=f_data.get("hint"),
+                                    order_index=f_idx
+                                )
+                                db.add(flashcard)
+                                total_flashcards_generated += 1
+
+                    db.commit()
+
+                    # Update counters
+                    total_questions_all_batches += total_questions_generated
+                    total_flashcards_all_batches += total_flashcards_generated
+
+                    # Remove processed topics
+                    subtopics_without_questions = subtopics_without_questions[BATCH_SIZE:]
+                    remaining_count = len(subtopics_without_questions)
+
+                    # Send progress event
+                    progress_data = {
+                        'batchNumber': batch_num,
+                        'generated': len(next_batch),
+                        'remaining': remaining_count,
+                        'totalQuestions': total_questions_generated,
+                        'totalFlashcards': total_flashcards_generated,
+                        'cumulativeQuestions': total_questions_all_batches,
+                        'cumulativeFlashcards': total_flashcards_all_batches,
+                        'hasMore': remaining_count > 0
+                    }
+
+                    logger.info(f"✅ SSE Stream - Batch {batch_num} complete: {total_questions_generated}Q, {total_flashcards_generated}F. Remaining: {remaining_count}")
+                    yield f"event: progress\ndata: {json.dumps(progress_data)}\n\n"
+
+                    # Small delay between batches
+                    await asyncio.sleep(0.5)
+
+                except Exception as e:
+                    logger.error(f"❌ SSE Stream - Batch {batch_num} failed: {e}")
+                    yield f"event: error\ndata: {json.dumps({{'error': str(e), 'batch': batch_num}})}\n\n"
+                    break
+
+            # Send completion event
+            completion_data = {
+                'message': 'All questions generated successfully',
+                'totalQuestions': total_questions_all_batches,
+                'totalFlashcards': total_flashcards_all_batches,
+                'batchesCompleted': batch_num
+            }
+            logger.info(f"🎉 SSE Stream complete: {total_questions_all_batches}Q, {total_flashcards_all_batches}F")
+            yield f"event: complete\ndata: {json.dumps(completion_data)}\n\n"
+
+        except Exception as e:
+            logger.error(f"❌ SSE stream error: {e}")
+            yield f"event: error\ndata: {json.dumps({{'error': str(e)}})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+            "Connection": "keep-alive",
+        }
+    )
 
 
 @router.delete("/{session_id}")
