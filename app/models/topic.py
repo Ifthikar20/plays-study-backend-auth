@@ -1,8 +1,9 @@
 """
 Topic database model.
 """
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Text, Float, ARRAY
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
 from app.database import Base
 from app.models.study_session import GUID
 from typing import Optional
@@ -35,10 +36,19 @@ class Topic(Base):
     # Will be removed after migration is complete
     mentor_narrative = Column(Text, nullable=True)
 
+    # Workflow visualization fields (for skill-tree/progress tree UI)
+    position_x = Column(Float, nullable=True)  # X coordinate in workflow visualization
+    position_y = Column(Float, nullable=True)  # Y coordinate in workflow visualization
+    workflow_stage = Column(String, default="locked")  # locked, quiz_available, quiz_completed, flashcard_review, completed
+
+    # Prerequisite tracking (topics that must be completed before this one unlocks)
+    prerequisite_topic_ids = Column(PG_ARRAY(Integer), nullable=True)  # Array of topic IDs
+
     # Relationships
     study_session = relationship("StudySession", back_populates="topics")
     parent_topic = relationship("Topic", remote_side=[id], backref="subtopics")
     questions = relationship("Question", back_populates="topic", cascade="all, delete-orphan")
+    flashcards = relationship("Flashcard", back_populates="topic", cascade="all, delete-orphan")
 
     def set_mentor_narrative(self, narrative: Optional[str]):
         """
