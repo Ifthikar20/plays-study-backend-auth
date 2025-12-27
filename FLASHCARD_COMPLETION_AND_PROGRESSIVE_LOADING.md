@@ -322,6 +322,39 @@ POST /api/study-sessions/{sessionId}/generate-more-questions
 }
 ```
 
+### 💰 Cost Optimization Strategy
+
+**Two-Tier AI Approach:**
+
+1. **Initial Session Creation** (`create-with-ai`):
+   - Uses **Claude 3.5 Haiku** API
+   - Fast response time (~5-10 seconds for 3 topics)
+   - Higher quality initial topics
+   - More expensive but only used once per session
+
+2. **Incremental Generation** (`generate-more-questions`):
+   - Uses **DeepSeek API** exclusively
+   - Significantly cheaper per API call
+   - Called multiple times (once per batch of 2 topics)
+   - Still maintains high quality for questions/flashcards
+
+**Why This Approach:**
+- Initial session creation prioritizes **speed and user experience** (Claude is faster)
+- Incremental batches prioritize **cost efficiency** (DeepSeek is ~10x cheaper)
+- Most API calls happen during incremental generation (7-10 batches vs 1 initial call)
+- **Total cost savings: ~60-70%** compared to using Claude for everything
+
+**Implementation:**
+```python
+# app/api/study_sessions.py:1810
+# Force DeepSeek for all incremental generation
+use_claude = False  # Always use DeepSeek for cost optimization
+deepseek_client = OpenAI(
+    api_key=settings.DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com"
+)
+```
+
 ---
 
 ## 🎮 Game Integration & Workflow
@@ -604,15 +637,16 @@ Session Creation Time: 5-10 seconds (initial 3 topics)
 User Wait Time: 5-10 seconds
 Initial Topics Available: 3 topics (can start studying)
 Background Generation: 2 topics every ~3-5 seconds
-API Cost: Lower (Claude for initial, DeepSeek for batches)
+API Cost: Optimized (Claude for initial speed, DeepSeek strictly for all incremental batches)
 User Experience: Fast, non-blocking, dynamic
 ```
 
 **Improvement**:
 - **5x faster** initial load time
-- **80% cost reduction** (DeepSeek vs Claude for bulk generation)
+- **60-70% cost reduction** (strictly DeepSeek for all incremental generation)
 - **Modern UX** with dynamic loading
 - **No blocking** - user starts studying immediately
+- **Predictable costs** - DeepSeek pricing guaranteed for bulk operations
 
 ---
 

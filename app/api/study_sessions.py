@@ -1747,6 +1747,10 @@ async def generate_more_questions(
 
     This implements progressive loading - initially only first few subtopics have questions,
     calling this endpoint generates questions for the next batch.
+
+    COST OPTIMIZATION: This endpoint ALWAYS uses DeepSeek API (cheaper) instead of Claude.
+    Initial session creation uses Claude (faster/higher quality), but incremental batches
+    use DeepSeek to significantly reduce API costs while maintaining quality.
     """
     logger.info(f"📚 Generating more questions for session {session_id}")
 
@@ -1806,17 +1810,13 @@ async def generate_more_questions(
 
     extracted_text, _, _ = detect_file_type_and_extract(session.file_content)
 
-    # Initialize AI client
-    use_claude = bool(settings.ANTHROPIC_API_KEY)
-    if use_claude:
-        anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        logger.info("🚀 Using Claude Haiku for question generation")
-    else:
-        deepseek_client = OpenAI(
-            api_key=settings.DEEPSEEK_API_KEY,
-            base_url="https://api.deepseek.com"
-        )
-        logger.info("⏱️ Using DeepSeek")
+    # Initialize AI client - ALWAYS use DeepSeek for incremental generation (cheaper)
+    use_claude = False  # Force DeepSeek for progressive loading to reduce costs
+    deepseek_client = OpenAI(
+        api_key=settings.DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com"
+    )
+    logger.info("⏱️ Using DeepSeek for incremental question generation (cost optimization)")
 
     # Build prompt for next batch
     subtopics_list = ""
