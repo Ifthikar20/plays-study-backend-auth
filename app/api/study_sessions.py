@@ -502,7 +502,7 @@ class CreateStudySessionRequest(BaseModel):
     content: str = Field(..., min_length=10, max_length=100000000)  # 100MB limit for base64 encoded files (large PDFs)
     num_topics: int = Field(default=4, ge=1, le=100)  # Dynamic: 1-100 topics based on content size
     questions_per_topic: int = Field(default=15, ge=5, le=100)  # OPTIMIZED: Reduced from 50 to 15 for cost savings (40% reduction)
-    progressive_load: bool = Field(default=False)  # DISABLED: Generate ALL questions upfront for better UX
+    progressive_load: bool = Field(default=True)  # ENABLED: Generate questions progressively for faster initial load
 
 
 class AnalyzeContentRequest(BaseModel):
@@ -534,6 +534,8 @@ class CreateStudySessionResponse(BaseModel):
     hasFullStudy: bool
     hasSpeedRun: bool
     createdAt: Optional[int] = None  # Unix timestamp in milliseconds
+    progressiveLoad: Optional[bool] = False  # Whether questions are loading progressively
+    questionsRemaining: Optional[int] = 0  # Number of topics without questions yet
 
 
 @router.post("/analyze-content", response_model=ContentAnalysisResponse)
@@ -1051,26 +1053,35 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
         # For large documents, this processes multiple chunks separately and merges results
         logger.info(f"📡 Processing {len(document_chunks)} document chunk(s) to generate questions...")
 
-        # Generate questions for ALL subtopics during initial creation
-        # This ensures maximum question coverage from the uploaded document
-
         # Get list of all subtopic keys
         all_subtopic_keys = list(subtopic_map.keys())
 
-        logger.info(f"📚 Generating questions for ALL {len(all_subtopic_keys)} subtopics to maximize coverage")
-        logger.info(f"  Subtopics: {all_subtopic_keys}")
+        # PROGRESSIVE LOADING: Generate questions for only FIRST FEW topics initially
+        # This provides fast initial response, then frontend can call /generate-more-questions
+        if data.progressive_load:
+            # Generate questions for first 2-3 topics only (fast initial load)
+            initial_batch_size = min(3, len(all_subtopic_keys))
+            subtopics_to_generate = all_subtopic_keys[:initial_batch_size]
+            logger.info(f"⚡ PROGRESSIVE LOAD: Generating questions for FIRST {initial_batch_size}/{len(all_subtopic_keys)} subtopics")
+            logger.info(f"  Initial batch: {subtopics_to_generate}")
+            logger.info(f"  📡 Frontend can call /generate-more-questions to load remaining {len(all_subtopic_keys) - initial_batch_size} topics")
+        else:
+            # Generate ALL questions upfront (slower but complete)
+            subtopics_to_generate = all_subtopic_keys
+            logger.info(f"📚 Generating questions for ALL {len(all_subtopic_keys)} subtopics to maximize coverage")
+            logger.info(f"  Subtopics: {all_subtopic_keys}")
 
         # BATCH SUBTOPICS: Process in groups to avoid AI refusing due to response size
         # With 2 subtopics per batch, max ~60 questions per request (2 * 30) - ensures ALL topics get questions
         SUBTOPICS_PER_BATCH = 2  # Reduced to ensure AI generates questions for ALL topics
         subtopic_batches = []
 
-        # Split subtopics into batches
-        for i in range(0, len(all_subtopic_keys), SUBTOPICS_PER_BATCH):
-            batch_keys = all_subtopic_keys[i:i + SUBTOPICS_PER_BATCH]
+        # Split subtopics into batches (only for selected subtopics_to_generate)
+        for i in range(0, len(subtopics_to_generate), SUBTOPICS_PER_BATCH):
+            batch_keys = subtopics_to_generate[i:i + SUBTOPICS_PER_BATCH]
             subtopic_batches.append(batch_keys)
 
-        logger.info(f"📦 Split {len(all_subtopic_keys)} subtopics into {len(subtopic_batches)} batches of up to {SUBTOPICS_PER_BATCH}")
+        logger.info(f"📦 Split {len(subtopics_to_generate)} subtopics into {len(subtopic_batches)} batches of up to {SUBTOPICS_PER_BATCH}")
 
         # Collect questions from all chunks
         all_chunk_questions = {}  # {subtopic_key: [questions]}
@@ -1536,6 +1547,9 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
             # Don't fail the request if caching fails
             logger.warning(f"⚠️ Failed to cache generated content: {cache_error}")
 
+        # Calculate how many topics don't have questions yet (for progressive loading)
+        topics_without_questions = len(all_subtopic_keys) - len(subtopics_to_generate)
+
         return CreateStudySessionResponse(
             id=str(study_session.id),  # Convert UUID to string
             title=study_session.title,
@@ -1548,7 +1562,9 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
             topics=len(all_topics),
             hasFullStudy=True,
             hasSpeedRun=True,
-            createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None
+            createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None,
+            progressiveLoad=data.progressive_load,
+            questionsRemaining=topics_without_questions
         )
 
     except HTTPException:
