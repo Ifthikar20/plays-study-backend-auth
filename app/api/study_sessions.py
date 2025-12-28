@@ -470,6 +470,14 @@ def convert_pptx_to_pdf(pptx_base64: str) -> Optional[str]:
                 logger.warning(f"Failed to clean up temp directory: {e}")
 
 
+class FlashcardSchema(BaseModel):
+    """Schema for a flashcard."""
+    id: str
+    front: str
+    back: str
+    hint: Optional[str] = None
+
+
 class QuestionSchema(BaseModel):
     """Schema for a quiz question."""
     id: str
@@ -488,12 +496,14 @@ class TopicSchema(BaseModel):
     title: str
     description: str
     questions: List[QuestionSchema] = []
+    flashcards: List[FlashcardSchema] = []
     completed: bool = False
     score: Optional[int] = None
     currentQuestionIndex: int = 0
     isCategory: bool = False
     parentTopicId: Optional[str] = None
     subtopics: List['TopicSchema'] = []
+    workflowStage: Optional[str] = None
 
 # Enable forward references for recursive schema
 TopicSchema.model_rebuild()
@@ -1803,60 +1813,78 @@ async def get_study_session(
         Topic.study_session_id == uuid_obj
     ).order_by(Topic.order_index).all()
 
-    # Build hierarchical structure
-    categories = [t for t in all_topics if t.is_category and t.parent_topic_id is None]
+    # Build hierarchical structure recursively
+    def build_topic_tree(topic: Topic, path: str, parent_id: str = None) -> TopicSchema:
+        """
+        Recursively build topic tree with all questions and subtopics.
+        Supports unlimited depth (though we limit to 3 levels during creation).
+        """
+        # Fetch questions for this topic
+        questions = db.query(Question).filter(
+            Question.topic_id == topic.id
+        ).order_by(Question.order_index).all()
 
-    result_topics = []
+        questions_list = [
+            QuestionSchema(
+                id=f"{path}-q{q.order_index+1}",
+                question=q.question,
+                options=q.options,
+                correctAnswer=q.correct_answer,
+                explanation=q.explanation,
+                sourceText=q.source_text,
+                sourcePage=q.source_page
+            )
+            for q in questions
+        ]
 
-    for cat_idx, category in enumerate(categories):
-        # Get subtopics for this category
-        subtopics = [t for t in all_topics if t.parent_topic_id == category.id]
+        # Find all direct children of this topic
+        children = [t for t in all_topics if t.parent_topic_id == topic.id]
 
-        category_schema = TopicSchema(
-            id=f"category-{cat_idx+1}",
-            db_id=category.id,  # Include database ID
-            title=category.title,
-            description=category.description or "",
-            isCategory=True,
-            parentTopicId=None,
-            questions=[],
-            subtopics=[]
+        # Recursively build subtopics
+        subtopics_list = []
+        for child_idx, child in enumerate(children):
+            child_path = f"{path}-{child_idx+1}"
+            child_schema = build_topic_tree(child, child_path, path)
+            subtopics_list.append(child_schema)
+
+        # Fetch flashcards for this topic
+        flashcards = db.query(Flashcard).filter(
+            Flashcard.topic_id == topic.id
+        ).order_by(Flashcard.order_index).all()
+
+        flashcards_list = [
+            FlashcardSchema(
+                id=f"{path}-f{f.order_index+1}",
+                front=f.front,
+                back=f.back,
+                hint=f.hint
+            )
+            for f in flashcards
+        ]
+
+        return TopicSchema(
+            id=path,
+            db_id=topic.id,
+            title=topic.title,
+            description=topic.description or "",
+            questions=questions_list,
+            flashcards=flashcards_list,
+            completed=topic.completed or False,
+            score=topic.score,
+            currentQuestionIndex=topic.current_question_index or 0,
+            isCategory=topic.is_category,
+            parentTopicId=parent_id,
+            subtopics=subtopics_list,
+            workflowStage=topic.workflow_stage
         )
 
-        for sub_idx, subtopic in enumerate(subtopics):
-            # Fetch questions for this subtopic
-            questions = db.query(Question).filter(
-                Question.topic_id == subtopic.id
-            ).order_by(Question.order_index).all()
+    # Start with top-level categories (parent_topic_id=None)
+    categories = [t for t in all_topics if t.parent_topic_id is None]
 
-            questions_list = [
-                QuestionSchema(
-                    id=f"topic-{sub_idx+1}-q{q.order_index+1}",
-                    question=q.question,
-                    options=q.options,
-                    correctAnswer=q.correct_answer,
-                    explanation=q.explanation,
-                    sourceText=q.source_text,
-                    sourcePage=q.source_page
-                )
-                for q in questions
-            ]
-
-            subtopic_schema = TopicSchema(
-                id=f"subtopic-{cat_idx+1}-{sub_idx+1}",
-                db_id=subtopic.id,  # Include database ID for progress sync
-                title=subtopic.title,
-                description=subtopic.description or "",
-                questions=questions_list,
-                completed=subtopic.completed or False,
-                score=subtopic.score,
-                currentQuestionIndex=subtopic.current_question_index or 0,
-                isCategory=False,
-                parentTopicId=f"category-{cat_idx+1}",
-                subtopics=[]
-            )
-            category_schema.subtopics.append(subtopic_schema)
-
+    result_topics = []
+    for cat_idx, category in enumerate(categories):
+        category_path = f"category-{cat_idx+1}"
+        category_schema = build_topic_tree(category, category_path, None)
         result_topics.append(category_schema)
 
     # Calculate progress
@@ -2544,6 +2572,13 @@ Return in this EXACT format:
                                 total_flashcards_generated += 1
 
                     db.commit()
+                    logger.info(f"💾 Database committed - {total_questions_generated}Q and {total_flashcards_generated}F saved")
+
+                    # Log which topics got questions
+                    for key, topic in subtopic_map.items():
+                        q_count = len(subtopics_questions.get(key, {}).get("questions", []))
+                        f_count = len(subtopics_questions.get(key, {}).get("flashcards", []))
+                        logger.info(f"   📝 Topic ID {topic.id} '{topic.title}': {q_count}Q, {f_count}F")
 
                     # Update counters
                     total_questions_all_batches += total_questions_generated
@@ -2566,6 +2601,7 @@ Return in this EXACT format:
                     }
 
                     logger.info(f"✅ SSE Stream - Batch {batch_num} complete: {total_questions_generated}Q, {total_flashcards_generated}F. Remaining: {remaining_count}")
+                    logger.info(f"📡 Sending progress event to frontend: {progress_data}")
                     yield f"event: progress\ndata: {json.dumps(progress_data)}\n\n"
 
                     # Small delay between batches
