@@ -13,7 +13,7 @@ from app.core.nonce_manager import nonce_manager
 from app.middleware.encryption_middleware import EncryptionMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.middleware.audit_logging import AuditLoggingMiddleware
-from app.api import auth, app_data, questions, study_sessions, tts, crypto, folders, recommendations
+from app.api import auth, app_data, questions, study_sessions, tts, crypto, folders, recommendations, games
 from app.database import Base, engine
 import logging
 
@@ -140,6 +140,12 @@ app.include_router(
     recommendations.router,
     prefix=settings.API_V1_PREFIX,
     tags=["Recommendations"],
+)
+
+app.include_router(
+    games.router,
+    prefix=f"{settings.API_V1_PREFIX}/games",
+    tags=["Educational Games"],
 )
 
 

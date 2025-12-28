@@ -2,8 +2,9 @@
 Study Sessions API endpoints with AI content processing.
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, AsyncGenerator
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime
@@ -18,6 +19,7 @@ import tempfile
 import subprocess
 import os
 import hashlib
+import asyncio
 from docx import Document
 from PyPDF2 import PdfReader
 from pptx import Presentation
@@ -29,6 +31,7 @@ from app.models.study_session import StudySession
 from app.models.topic import Topic
 from app.models.question import Question
 from app.models.flashcard import Flashcard
+from app.models.game_completion import GameCompletion
 from app.core.rate_limit import limiter
 from app.core.cache import get_cache, set_cache
 
@@ -467,6 +470,14 @@ def convert_pptx_to_pdf(pptx_base64: str) -> Optional[str]:
                 logger.warning(f"Failed to clean up temp directory: {e}")
 
 
+class FlashcardSchema(BaseModel):
+    """Schema for a flashcard."""
+    id: str
+    front: str
+    back: str
+    hint: Optional[str] = None
+
+
 class QuestionSchema(BaseModel):
     """Schema for a quiz question."""
     id: str
@@ -485,12 +496,14 @@ class TopicSchema(BaseModel):
     title: str
     description: str
     questions: List[QuestionSchema] = []
+    flashcards: List[FlashcardSchema] = []
     completed: bool = False
     score: Optional[int] = None
     currentQuestionIndex: int = 0
     isCategory: bool = False
     parentTopicId: Optional[str] = None
     subtopics: List['TopicSchema'] = []
+    workflowStage: Optional[str] = None
 
 # Enable forward references for recursive schema
 TopicSchema.model_rebuild()
@@ -501,8 +514,8 @@ class CreateStudySessionRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     content: str = Field(..., min_length=10, max_length=100000000)  # 100MB limit for base64 encoded files (large PDFs)
     num_topics: int = Field(default=4, ge=1, le=100)  # Dynamic: 1-100 topics based on content size
-    questions_per_topic: int = Field(default=15, ge=5, le=100)  # OPTIMIZED: Reduced from 50 to 15 for cost savings (40% reduction)
-    progressive_load: bool = Field(default=True)  # ENABLED: Generate questions progressively for faster initial load
+    questions_per_topic: int = Field(default=30, ge=5, le=100)  # Generate 30 questions per topic for comprehensive coverage
+    progressive_load: bool = Field(default=True)  # ENABLED: Generate questions incrementally using DeepSeek (cheaper) - initial batch only, then call /generate-more-questions
 
 
 class AnalyzeContentRequest(BaseModel):
@@ -719,14 +732,25 @@ async def create_study_session_with_ai(
             db.flush()
 
             # Recreate topics and questions from cached structure
+            first_leaf_topic_initialized = False
             for topic_data in cached_result['topics']:
+                # Determine initial workflow stage
+                # First non-category topic should be quiz_available, others locked
+                is_category = topic_data['is_category']
+                if not is_category and not first_leaf_topic_initialized:
+                    initial_workflow_stage = "quiz_available"
+                    first_leaf_topic_initialized = True
+                else:
+                    initial_workflow_stage = "locked"
+
                 topic = Topic(
                     study_session_id=study_session.id,
                     parent_topic_id=topic_data.get('parent_topic_id'),
                     title=topic_data['title'],
                     description=topic_data['description'],
                     order_index=topic_data['order_index'],
-                    is_category=topic_data['is_category']
+                    is_category=is_category,
+                    workflow_stage=initial_workflow_stage
                 )
                 db.add(topic)
                 db.flush()
@@ -778,7 +802,9 @@ async def create_study_session_with_ai(
                 topics=len(result_topics),
                 hasFullStudy=True,
                 hasSpeedRun=True,
-                createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None
+                createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None,
+                progressiveLoad=False,  # Cached sessions have all questions already
+                questionsRemaining=0  # All questions already generated from cache
             )
 
         logger.info(f"📝 Cache MISS - Generating new AI content for hash {content_hash}")
@@ -833,13 +859,26 @@ Requirements:
 1. Create approximately {num_categories} major categories that organize the content at a high level
 2. Within each category, break down into focused subtopics (2-3 levels maximum)
 3. Prioritize QUALITY over excessive nesting - only create subtopics when there's sufficient content to generate meaningful questions
-4. Each leaf node should be a focused concept that can support 5-15 quality questions
+4. Each leaf node should be a focused concept that can support 25-35 quality questions
 5. Provide clear titles and brief descriptions at ALL levels
 6. Organize logically (foundational concepts first, building to advanced topics)
 7. Create approximately {initial_topics} total LEAF topics across all categories that will actually have questions
 8. Avoid creating unnecessary intermediate categories - go directly to testable concepts when possible
 9. Focus on core concepts and foundational topics first
 10. Remember: The goal is quality questions, not deep nesting
+
+CRITICAL - NO DUPLICATES:
+- NEVER create the same topic twice at any level
+- Each topic title must be unique within its sibling group
+- If a concept appears twice, consolidate it into ONE topic
+- Example: Don't create both "Workplace Stress" AND "Work-Related Stress" - they're duplicates!
+- Validate each level for duplicate titles before including in JSON
+
+CRITICAL - NO OVERLAPPING:
+- Sibling topics must be mutually exclusive (no overlap)
+- Each topic should have a distinct, focused scope
+- Example GOOD: "Verbal Communication", "Non-Verbal Communication", "Written Communication" (distinct)
+- Example BAD: "Face-to-Face Communication", "Verbal Communication", "Body Language" (overlap!)
 
 IMPORTANT: Keep the structure simple and focused. Only nest 2-3 levels deep. Empty subtopics with no questions provide no value.
 
@@ -919,6 +958,117 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             raise HTTPException(status_code=500, detail=f"Failed to parse topics: {str(e)}")
 
+        # CRITICAL: Deduplicate topics to prevent duplicate subtopics (e.g., same topic appearing twice)
+        def deduplicate_topics(topics_list: list, parent_title: str = "ROOT", level: int = 0) -> tuple:
+            """
+            Recursively deduplicate topics by title at each level.
+            Keeps the first occurrence and removes subsequent duplicates (including all their subtopics).
+
+            Args:
+                topics_list: List of topic dictionaries to deduplicate
+                parent_title: Title of parent topic for logging context
+                level: Current nesting level for logging
+
+            Returns:
+                Tuple of (deduplicated_list, duplicate_count)
+            """
+            seen_titles = set()
+            deduplicated = []
+            duplicates_removed = 0
+
+            for idx, topic in enumerate(topics_list):
+                title = topic.get("title", "").strip()
+                title_lower = title.lower()
+
+                # Check if we've already seen this title at this level
+                if title_lower in seen_titles:
+                    # Count subtopics that will be removed along with duplicate
+                    subtopic_count = len(topic.get("subtopics", []))
+                    logger.warning(
+                        f"{'  ' * level}⚠️ DUPLICATE REMOVED at level {level}: "
+                        f"'{title}' (duplicate #{idx + 1}) under '{parent_title}'"
+                    )
+                    if subtopic_count > 0:
+                        logger.warning(
+                            f"{'  ' * level}   └─ Also removing {subtopic_count} subtopic(s) under duplicate '{title}'"
+                        )
+                    duplicates_removed += 1
+                    continue
+
+                # Mark this title as seen at this level
+                seen_titles.add(title_lower)
+
+                # Recursively deduplicate subtopics
+                if "subtopics" in topic and isinstance(topic["subtopics"], list):
+                    topic["subtopics"], child_duplicates = deduplicate_topics(
+                        topic["subtopics"],
+                        parent_title=title,
+                        level=level + 1
+                    )
+                    duplicates_removed += child_duplicates
+
+                deduplicated.append(topic)
+
+            return deduplicated, duplicates_removed
+
+        # Apply deduplication to all categories and their children
+        logger.info("🔍 Starting deduplication check across all topic levels...")
+        categories_data, total_duplicates = deduplicate_topics(categories_data, parent_title="ROOT", level=0)
+
+        if total_duplicates > 0:
+            logger.warning(f"⚠️ REMOVED {total_duplicates} DUPLICATE TOPIC(S) (including their subtopics)")
+        else:
+            logger.info(f"✅ No duplicates found - all topics are unique")
+
+        logger.info(f"✅ Deduplication complete - {len(categories_data)} unique top-level categories")
+
+        # VERIFICATION: Check for any remaining duplicates across entire hierarchy
+        def verify_no_duplicates(topics_list: list, all_titles: dict = None, path: str = "") -> tuple:
+            """
+            Verify no duplicate titles exist across the entire hierarchy.
+            Returns (is_valid, duplicate_info_list)
+            """
+            if all_titles is None:
+                all_titles = {}
+
+            duplicates_found = []
+
+            for topic in topics_list:
+                title = topic.get("title", "").strip()
+                title_lower = title.lower()
+                current_path = f"{path}/{title}" if path else title
+
+                # Check if this title was seen before
+                if title_lower in all_titles:
+                    duplicates_found.append({
+                        "title": title,
+                        "first_seen": all_titles[title_lower],
+                        "duplicate_at": current_path
+                    })
+                else:
+                    all_titles[title_lower] = current_path
+
+                # Recursively check subtopics
+                if "subtopics" in topic and isinstance(topic["subtopics"], list):
+                    _, child_duplicates = verify_no_duplicates(
+                        topic["subtopics"],
+                        all_titles,
+                        current_path
+                    )
+                    duplicates_found.extend(child_duplicates)
+
+            return (len(duplicates_found) == 0, duplicates_found)
+
+        is_valid, found_duplicates = verify_no_duplicates(categories_data)
+        if not is_valid:
+            logger.error(f"❌ VERIFICATION FAILED: Found {len(found_duplicates)} duplicate(s) after deduplication:")
+            for dup in found_duplicates:
+                logger.error(f"   - '{dup['title']}' appears at both:")
+                logger.error(f"     1. {dup['first_seen']}")
+                logger.error(f"     2. {dup['duplicate_at']}")
+        else:
+            logger.info(f"✅ VERIFICATION PASSED: No duplicates found in entire hierarchy")
+
         # Count total subtopics for the session
         total_subtopics = sum(len(cat.get("subtopics", [])) for cat in categories_data)
 
@@ -955,6 +1105,7 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
         all_topics = []
         subtopic_map = {}  # Map to track subtopics for batch question assignment
         overall_idx = 0
+        first_leaf_topic_created = {'value': False}  # Track if first leaf topic has been created (use dict for mutability in closure)
 
         # Recursive helper function to create topics at any depth
         def create_topics_recursive(
@@ -982,6 +1133,29 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
             has_children = len(subtopics_data) > 0
             is_leaf = not has_children
 
+            # Determine initial workflow stage
+            # First leaf topic (non-category) should be quiz_available, all others locked
+            if is_leaf and not first_leaf_topic_created['value']:
+                initial_workflow_stage = "quiz_available"
+                first_leaf_topic_created['value'] = True
+                logger.info(f"🎯 First leaf topic '{topic_data['title']}' (path: {path}) - setting to quiz_available")
+            else:
+                initial_workflow_stage = "locked"
+
+            # SAFETY CHECK: Ensure no duplicate title under same parent (database-level protection)
+            existing_sibling = db.query(Topic).filter(
+                Topic.study_session_id == study_session.id,
+                Topic.parent_topic_id == parent_topic_id,
+                Topic.title == topic_data["title"]
+            ).first()
+
+            if existing_sibling:
+                logger.error(
+                    f"❌ DATABASE DUPLICATE DETECTED: Topic '{topic_data['title']}' already exists "
+                    f"under parent {parent_topic_id} (session {study_session.id}). Skipping creation."
+                )
+                return None
+
             # Create topic in database
             topic = Topic(
                 study_session_id=study_session.id,
@@ -989,10 +1163,12 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
                 title=topic_data["title"],
                 description=topic_data.get("description", ""),
                 order_index=order_index,
-                is_category=has_children  # Non-leaf nodes are categories
+                is_category=has_children,  # Non-leaf nodes are categories
+                workflow_stage=initial_workflow_stage
             )
             db.add(topic)
             db.flush()
+            logger.debug(f"✅ Created topic '{topic_data['title']}' (ID: {topic.id}, path: {path})")
 
             # Create schema
             topic_schema = TopicSchema(
@@ -1048,6 +1224,12 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
             )
             if category_schema:
                 all_topics.append(category_schema)
+
+        # FINAL SUMMARY: Report total topics created
+        total_topics_in_db = db.query(Topic).filter(Topic.study_session_id == study_session.id).count()
+        logger.info(f"📊 FINAL TOPIC COUNT: {total_topics_in_db} total topics created (all unique, no duplicates)")
+        logger.info(f"   └─ Top-level categories: {len(all_topics)}")
+        logger.info(f"   └─ All subtopics (for questions): {len(subtopic_map)}")
 
         # Step 4: Generate questions by processing each document chunk
         # For large documents, this processes multiple chunks separately and merges results
@@ -1113,8 +1295,8 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
 
 CRITICAL: Generate high-quality, comprehensive questions AND flashcards:
 - Extract the MOST IMPORTANT testable concepts, facts, principles, definitions, and examples from the material
-- Aim for 15-20 high-quality questions per topic (quality over quantity)
-- Generate 3-5 flashcards per topic for post-quiz review (spaced repetition learning)
+- Aim for 25-35 high-quality questions per topic for comprehensive coverage
+- Generate 10-15 flashcards per topic for post-quiz review (spaced repetition learning)
 - Break down key concepts into multiple questions from different angles
 - Test each concept in multiple ways: definition, application, comparison, analysis, synthesis, evaluation
 - Create questions for the most important content in the study material
@@ -1157,8 +1339,9 @@ TOPICS TO COVER ({len(batch_keys)} topics in this batch):
 {subtopics_list}
 
 Requirements:
-1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch)
-2. Extract the MOST IMPORTANT testable information from the study material
+1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch of 2 topics)
+2. Generate 8-12 flashcards for EACH topic for spaced repetition review
+3. Extract the MOST IMPORTANT testable information from the study material
 3. NO DUPLICATES - each question must test a unique concept or angle
 4. For EACH topic, include multiple EXAMPLE-BASED questions (e.g., "Which scenario is an example of operant conditioning?")
 5. Each question must have exactly 4 PLAUSIBLE options (all should seem correct to someone who doesn't understand deeply)
@@ -1181,16 +1364,21 @@ JSON FORMATTING RULES (CRITICAL):
 - Do NOT include comments in the JSON
 
 IMPORTANT INSTRUCTIONS:
-- Do NOT ask clarifying questions
-- Do NOT say "I understand" or provide explanations
-- Do NOT add any text before or after the JSON
-- START your response IMMEDIATELY with the opening brace: {{
-- Generate the complete JSON response now
+- DO NOT ASK ANY QUESTIONS - you have all the information you need
+- DO NOT SAY "I understand" or "I'll help" or provide ANY explanations
+- DO NOT ADD ANY TEXT before or after the JSON
+- YOUR FIRST CHARACTER MUST BE: {{
+- YOUR LAST CHARACTER MUST BE: }}
+- OUTPUT ONLY THE JSON OBJECT - NOTHING ELSE
 
-GOAL: Create 15-20 comprehensive questions per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
+YOU MUST START YOUR RESPONSE WITH THIS EXACT CHARACTER: {{
+
+Begin JSON output now:
+
+GOAL: Create 25-35 comprehensive questions per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
 
 FLASHCARD REQUIREMENTS:
-- Generate 3-5 flashcards per topic for post-quiz review
+- Generate 10-15 flashcards per topic for post-quiz review
 - Flashcards should cover KEY DEFINITIONS, CONCEPTS, and TERMS
 - Front: Question or term (concise, clear)
 - Back: Answer or definition (comprehensive but digestible)
@@ -1202,7 +1390,7 @@ CRITICAL REQUIREMENTS:
 - You MUST generate questions AND flashcards for EVERY SINGLE topic key listed above - NO EXCEPTIONS
 - If a topic is listed, it MUST appear in your JSON response with questions AND flashcards
 - Missing even ONE topic key will result in incomplete learning coverage
-- Each topic MUST have 15-20 questions (aim for 20 when possible) AND 3-5 flashcards
+- Each topic MUST have 15-20 questions (aim for 20 when possible) AND 8-12 flashcards
 
 Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic listed must be in the response):
 {{
@@ -1217,7 +1405,7 @@ Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic
           "sourceText": "The complete sentence or paragraph from the study material with context.",
           "sourcePage": null
         }},
-        ... (10-30+ questions for topic "0")
+        ... (25-35 questions for topic "0")
       ],
       "flashcards": [
         {{
@@ -1225,17 +1413,17 @@ Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic
           "back": "X is defined as...",
           "hint": "Remember: X starts with..."
         }},
-        ... (3-5 flashcards for topic "0")
+        ... (10-15 flashcards for topic "0")
       ]
     }},
     "0-1": {{
       "questions": [
         {{question object}},
-        ... (10-30+ questions for topic "0-1")
+        ... (25-35 questions for topic "0-1")
       ],
       "flashcards": [
         {{flashcard object}},
-        ... (3-5 flashcards for topic "0-1")
+        ... (10-15 flashcards for topic "0-1")
       ]
     }},
     ... (MUST include ALL topic keys from the list above)
@@ -1255,13 +1443,18 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
                 try:
                     if use_claude and anthropic_client:
                         try:
+                            # Use prefill technique to force JSON response (prevents conversational responses)
                             batch_response = anthropic_client.messages.create(
                                 model="claude-3-5-haiku-20241022",
                                 max_tokens=8192,  # Maximum output tokens for Claude 3.5 Haiku
                                 temperature=0.7,
-                                messages=[{"role": "user", "content": batch_prompt}]
+                                messages=[
+                                    {"role": "user", "content": batch_prompt},
+                                    {"role": "assistant", "content": "{"}  # Prefill with opening brace to force JSON
+                                ]
                             )
-                            batch_text = batch_response.content[0].text
+                            # Prepend the opening brace since it was in the prefill
+                            batch_text = "{" + batch_response.content[0].text
                         except Exception as claude_error:
                             logger.warning(f"⚠️ Claude API failed for chunk {chunk_idx} batch {batch_num}: {str(claude_error)}")
                             if deepseek_client:
@@ -1362,19 +1555,17 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
         for subtopic_key, subtopic_info in subtopic_map.items():
             subtopic = subtopic_info["topic"]
             subtopic_schema = subtopic_info["schema"]
-            # Get parent schema (either category_schema or subtopic_schema)
-            parent_schema = subtopic_info.get("category_schema") or subtopic_info.get("subtopic_schema")
+            # Get parent schema (category or parent subtopic)
+            parent_schema = subtopic_info.get("parent_schema")
 
             # Get questions for this subtopic from batch response
             questions_data = subtopics_questions.get(subtopic_key, {}).get("questions", [])
 
-            # Skip if no questions generated
+            # Skip if no questions generated (in progressive loading, this is expected for topics beyond the initial batch)
             if not questions_data:
-                # Expected to have questions for all subtopics
-                logger.warning(f"⚠️ No questions generated for subtopic '{subtopic_key}' ('{subtopic.title}') - SKIPPING (may lack relevant content in document)")
-                # If this is a sub-subtopic without questions, still add it to parent
-                if "subtopic_schema" in subtopic_info:
-                    parent_schema.subtopics.append(subtopic_schema)
+                logger.info(f"⏭️ No questions for subtopic '{subtopic_key}' ('{subtopic.title}') - will be generated later via SSE")
+                # Note: The topic is already in the parent's subtopics list (added during creation)
+                # It just has an empty questions array, which will be populated later
                 continue
             else:
                 logger.info(f"✅ Found {len(questions_data)} questions for subtopic '{subtopic_key}' ('{subtopic.title}')")
@@ -1449,10 +1640,9 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
                     db.add(flashcard)
 
             # Update subtopic schema with questions
+            # Note: subtopic_schema is already in parent's subtopics list (added during creation at line 1212)
+            # We're just updating the questions property of the existing schema object
             subtopic_schema.questions = questions_list
-            # Add to parent (either category or parent subtopic)
-            if parent_schema:
-                parent_schema.subtopics.append(subtopic_schema)
 
         # Validate that questions were generated for a reasonable number of subtopics
         subtopics_with_questions = len([k for k, v in subtopics_questions.items() if v.get("questions")])
@@ -1550,6 +1740,25 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
         # Calculate how many topics don't have questions yet (for progressive loading)
         topics_without_questions = len(all_subtopic_keys) - len(subtopics_to_generate)
 
+        # Log summary of what's being returned
+        logger.info(f"📊 RESPONSE SUMMARY:")
+        logger.info(f"  ✅ Generated {question_counter} total questions for {len(subtopics_to_generate)} topics")
+        logger.info(f"  📡 {topics_without_questions} topics remaining (will be loaded via SSE)")
+
+        # Count questions in response for verification
+        def count_questions_recursive(topic_list):
+            total = 0
+            for topic in topic_list:
+                total += len(topic.questions)
+                total += count_questions_recursive(topic.subtopics)
+            return total
+
+        questions_in_response = count_questions_recursive(all_topics)
+        logger.info(f"  📋 Response includes {questions_in_response} questions in topic tree")
+
+        # Handle both Pydantic model and dict access patterns (defensive coding)
+        progressive_load_value = data.progressive_load if hasattr(data, 'progressive_load') else data.get('progressive_load', False)
+
         return CreateStudySessionResponse(
             id=str(study_session.id),  # Convert UUID to string
             title=study_session.title,
@@ -1563,7 +1772,7 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
             hasFullStudy=True,
             hasSpeedRun=True,
             createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None,
-            progressiveLoad=data.progressive_load,
+            progressiveLoad=progressive_load_value,
             questionsRemaining=topics_without_questions
         )
 
@@ -1617,60 +1826,78 @@ async def get_study_session(
         Topic.study_session_id == uuid_obj
     ).order_by(Topic.order_index).all()
 
-    # Build hierarchical structure
-    categories = [t for t in all_topics if t.is_category and t.parent_topic_id is None]
+    # Build hierarchical structure recursively
+    def build_topic_tree(topic: Topic, path: str, parent_id: str = None) -> TopicSchema:
+        """
+        Recursively build topic tree with all questions and subtopics.
+        Supports unlimited depth (though we limit to 3 levels during creation).
+        """
+        # Fetch questions for this topic
+        questions = db.query(Question).filter(
+            Question.topic_id == topic.id
+        ).order_by(Question.order_index).all()
 
-    result_topics = []
+        questions_list = [
+            QuestionSchema(
+                id=f"{path}-q{q.order_index+1}",
+                question=q.question,
+                options=q.options,
+                correctAnswer=q.correct_answer,
+                explanation=q.explanation,
+                sourceText=q.source_text,
+                sourcePage=q.source_page
+            )
+            for q in questions
+        ]
 
-    for cat_idx, category in enumerate(categories):
-        # Get subtopics for this category
-        subtopics = [t for t in all_topics if t.parent_topic_id == category.id]
+        # Find all direct children of this topic
+        children = [t for t in all_topics if t.parent_topic_id == topic.id]
 
-        category_schema = TopicSchema(
-            id=f"category-{cat_idx+1}",
-            db_id=category.id,  # Include database ID
-            title=category.title,
-            description=category.description or "",
-            isCategory=True,
-            parentTopicId=None,
-            questions=[],
-            subtopics=[]
+        # Recursively build subtopics
+        subtopics_list = []
+        for child_idx, child in enumerate(children):
+            child_path = f"{path}-{child_idx+1}"
+            child_schema = build_topic_tree(child, child_path, path)
+            subtopics_list.append(child_schema)
+
+        # Fetch flashcards for this topic
+        flashcards = db.query(Flashcard).filter(
+            Flashcard.topic_id == topic.id
+        ).order_by(Flashcard.order_index).all()
+
+        flashcards_list = [
+            FlashcardSchema(
+                id=f"{path}-f{f.order_index+1}",
+                front=f.front,
+                back=f.back,
+                hint=f.hint
+            )
+            for f in flashcards
+        ]
+
+        return TopicSchema(
+            id=path,
+            db_id=topic.id,
+            title=topic.title,
+            description=topic.description or "",
+            questions=questions_list,
+            flashcards=flashcards_list,
+            completed=topic.completed or False,
+            score=topic.score,
+            currentQuestionIndex=topic.current_question_index or 0,
+            isCategory=topic.is_category,
+            parentTopicId=parent_id,
+            subtopics=subtopics_list,
+            workflowStage=topic.workflow_stage
         )
 
-        for sub_idx, subtopic in enumerate(subtopics):
-            # Fetch questions for this subtopic
-            questions = db.query(Question).filter(
-                Question.topic_id == subtopic.id
-            ).order_by(Question.order_index).all()
+    # Start with top-level categories (parent_topic_id=None)
+    categories = [t for t in all_topics if t.parent_topic_id is None]
 
-            questions_list = [
-                QuestionSchema(
-                    id=f"topic-{sub_idx+1}-q{q.order_index+1}",
-                    question=q.question,
-                    options=q.options,
-                    correctAnswer=q.correct_answer,
-                    explanation=q.explanation,
-                    sourceText=q.source_text,
-                    sourcePage=q.source_page
-                )
-                for q in questions
-            ]
-
-            subtopic_schema = TopicSchema(
-                id=f"subtopic-{cat_idx+1}-{sub_idx+1}",
-                db_id=subtopic.id,  # Include database ID for progress sync
-                title=subtopic.title,
-                description=subtopic.description or "",
-                questions=questions_list,
-                completed=subtopic.completed or False,
-                score=subtopic.score,
-                currentQuestionIndex=subtopic.current_question_index or 0,
-                isCategory=False,
-                parentTopicId=f"category-{cat_idx+1}",
-                subtopics=[]
-            )
-            category_schema.subtopics.append(subtopic_schema)
-
+    result_topics = []
+    for cat_idx, category in enumerate(categories):
+        category_path = f"category-{cat_idx+1}"
+        category_schema = build_topic_tree(category, category_path, None)
         result_topics.append(category_schema)
 
     # Calculate progress
@@ -1708,6 +1935,10 @@ async def generate_more_questions(
 
     This implements progressive loading - initially only first few subtopics have questions,
     calling this endpoint generates questions for the next batch.
+
+    COST OPTIMIZATION: This endpoint ALWAYS uses DeepSeek API (cheaper) instead of Claude.
+    Initial session creation uses Claude (faster/higher quality), but incremental batches
+    use DeepSeek to significantly reduce API costs while maintaining quality.
     """
     logger.info(f"📚 Generating more questions for session {session_id}")
 
@@ -1767,17 +1998,13 @@ async def generate_more_questions(
 
     extracted_text, _, _ = detect_file_type_and_extract(session.file_content)
 
-    # Initialize AI client
-    use_claude = bool(settings.ANTHROPIC_API_KEY)
-    if use_claude:
-        anthropic_client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-        logger.info("🚀 Using Claude Haiku for question generation")
-    else:
-        deepseek_client = OpenAI(
-            api_key=settings.DEEPSEEK_API_KEY,
-            base_url="https://api.deepseek.com"
-        )
-        logger.info("⏱️ Using DeepSeek")
+    # Initialize AI client - ALWAYS use DeepSeek for incremental generation (cheaper)
+    use_claude = False  # Force DeepSeek for progressive loading to reduce costs
+    deepseek_client = OpenAI(
+        api_key=settings.DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com"
+    )
+    logger.info("⏱️ Using DeepSeek for incremental question generation (cost optimization)")
 
     # Build prompt for next batch
     subtopics_list = ""
@@ -1803,11 +2030,12 @@ async def generate_more_questions(
             subtopics_list += f"Parent Category: {category_title}\n"
 
     # Build prompt
-    batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions for EACH of the following topics from the study material.
+    batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions AND flashcards for EACH of the following topics from the study material.
 
-CRITICAL: Generate the ABSOLUTE MAXIMUM number of questions possible:
+CRITICAL: Generate comprehensive questions and flashcards for all topics:
 - Extract EVERY testable concept, fact, principle, detail, definition, example, and implication from the material
-- DO NOT impose any limits on the number of questions - generate as many as the content supports (aim for 15-30+ questions per topic)
+- Generate 15-20 high-quality questions per topic (reduced from 25-35 to fit within API token limits)
+- Generate 8-12 flashcards per topic for spaced repetition learning
 - Break down EVERY concept into multiple questions from different angles
 - Test each concept in multiple ways: definition, application, comparison, analysis, synthesis, evaluation
 - Create questions for every sentence that contains testable information
@@ -1849,8 +2077,9 @@ TOPICS TO COVER ({len(next_batch)} topics in this batch):
 {subtopics_list}
 
 Requirements:
-1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch)
-2. Extract the MOST IMPORTANT testable information from the study material
+1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch of 2 topics)
+2. Generate 8-12 flashcards for EACH topic for spaced repetition review
+3. Extract the MOST IMPORTANT testable information from the study material
 3. NO DUPLICATES - each question must test a unique concept or angle
 4. For EACH topic, include multiple EXAMPLE-BASED questions (e.g., "Which scenario is an example of...?")
 5. Each question must have exactly 4 PLAUSIBLE options (all should seem correct to someone who doesn't understand deeply)
@@ -1873,19 +2102,32 @@ JSON FORMATTING RULES (CRITICAL):
 - Do NOT include comments in the JSON
 
 IMPORTANT INSTRUCTIONS:
-- Do NOT ask clarifying questions
-- Do NOT say "I understand" or provide explanations
-- Do NOT add any text before or after the JSON
-- START your response IMMEDIATELY with the opening brace: {{
-- Generate the complete JSON response now
+- DO NOT ASK ANY QUESTIONS - you have all the information you need
+- DO NOT SAY "I understand" or "I'll help" or provide ANY explanations
+- DO NOT ADD ANY TEXT before or after the JSON
+- YOUR FIRST CHARACTER MUST BE: {{
+- YOUR LAST CHARACTER MUST BE: }}
+- OUTPUT ONLY THE JSON OBJECT - NOTHING ELSE
 
-GOAL: Create 15-20 comprehensive questions per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
+YOU MUST START YOUR RESPONSE WITH THIS EXACT CHARACTER: {{
+
+Begin JSON output now:
+
+GOAL: Create 15-20 comprehensive questions AND 8-12 flashcards per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
+
+FLASHCARD REQUIREMENTS:
+- Generate 8-12 flashcards per topic for post-quiz review
+- Flashcards should cover KEY DEFINITIONS, CONCEPTS, and TERMS
+- Front: Question or term (concise, clear)
+- Back: Answer or definition (comprehensive but digestible)
+- Hint: Optional memory aid or mnemonic (can be null)
+- Flashcards complement questions - focus on memorization and quick recall
 
 CRITICAL REQUIREMENTS:
-- You MUST generate questions for EVERY SINGLE topic key listed above - NO EXCEPTIONS
-- If a topic is listed, it MUST appear in your JSON response with questions
+- You MUST generate questions AND flashcards for EVERY SINGLE topic key listed above - NO EXCEPTIONS
+- If a topic is listed, it MUST appear in your JSON response with questions AND flashcards
 - Missing even ONE topic key will result in incomplete learning coverage
-- Each topic MUST have 15-20 questions (aim for 20 when possible)
+- Each topic MUST have 15-20 questions (aim for 20 when possible) AND 8-12 flashcards
 
 Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic listed must be in the response):
 {{
@@ -1900,33 +2142,50 @@ Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic
           "sourceText": "The complete sentence or paragraph from the study material with context.",
           "sourcePage": null
         }},
-        ... (10-30+ questions for topic "topic-123")
+        ... (15-20 questions for topic "topic-123")
+      ],
+      "flashcards": [
+        {{
+          "front": "What is the definition of X?",
+          "back": "X is defined as...",
+          "hint": "Remember: X starts with..."
+        }},
+        ... (8-12 flashcards for topic "topic-123")
       ]
     }},
     "topic-456": {{
       "questions": [
         {{question object}},
-        ... (10-30+ questions for topic "topic-456")
+        ... (15-20 questions for topic "topic-456")
+      ],
+      "flashcards": [
+        {{flashcard object}},
+        ... (8-12 flashcards for topic "topic-456")
       ]
     }},
     ... (MUST include ALL topic keys from the list above)
   }}
 }}
 
-REMINDER: The response MUST include questions for ALL {len(next_batch)} topics listed above. Double-check that every topic key appears in your JSON response."""
+REMINDER: The response MUST include questions AND flashcards for ALL {len(next_batch)} topics listed above. Double-check that every topic key appears in your JSON response."""
 
     # Make API call
     logger.info(f"📊 Prompt length: {len(batch_prompt):,} characters")
 
     try:
         if use_claude:
+            # Use prefill technique to force JSON response (prevents conversational responses)
             batch_response = anthropic_client.messages.create(
                 model="claude-3-5-haiku-20241022",
                 max_tokens=8192,  # Maximum for Haiku (2 topics × ~20 questions each fits in 8k)
                 temperature=0.7,
-                messages=[{"role": "user", "content": batch_prompt}]
+                messages=[
+                    {"role": "user", "content": batch_prompt},
+                    {"role": "assistant", "content": "{"}  # Prefill with opening brace to force JSON
+                ]
             )
-            batch_text = batch_response.content[0].text
+            # Prepend the opening brace since it was in the prefill
+            batch_text = "{" + batch_response.content[0].text
             logger.info(f"📊 AI response stats: stop_reason={batch_response.stop_reason}, input_tokens={batch_response.usage.input_tokens}, output_tokens={batch_response.usage.output_tokens}")
         else:
             batch_response = deepseek_client.chat.completions.create(
@@ -1936,6 +2195,22 @@ REMINDER: The response MUST include questions for ALL {len(next_batch)} topics l
                 messages=[{"role": "user", "content": batch_prompt}]
             )
             batch_text = batch_response.choices[0].message.content
+
+            # Check for truncation in DeepSeek response
+            finish_reason = batch_response.choices[0].finish_reason
+            logger.info(f"📊 DeepSeek response stats: finish_reason={finish_reason}, prompt_tokens={batch_response.usage.prompt_tokens}, completion_tokens={batch_response.usage.completion_tokens}")
+
+            if finish_reason == "length":
+                logger.error(f"❌ DeepSeek response TRUNCATED - hit max_tokens limit!")
+                logger.error(f"❌ Response was cut off at {batch_response.usage.completion_tokens} tokens")
+                logger.error(f"❌ Last 500 chars of truncated response: ...{batch_text[-500:]}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"AI response was truncated at token limit. Please reduce the number of topics or questions per batch."
+                )
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as api_error:
         logger.error(f"❌ AI API call failed: {type(api_error).__name__}: {str(api_error)}")
         raise HTTPException(status_code=500, detail=f"AI API error: {str(api_error)}")
@@ -1991,11 +2266,13 @@ REMINDER: The response MUST include questions for ALL {len(next_batch)} topics l
         logger.error(f"❌ Failed to parse questions: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to parse AI response: {str(e)}")
 
-    # Save questions to database
+    # Save questions and flashcards to database
     total_questions_generated = 0
+    total_flashcards_generated = 0
 
     for key, topic in subtopic_map.items():
         questions_data = subtopics_questions.get(key, {}).get("questions", [])
+        flashcards_data = subtopics_questions.get(key, {}).get("flashcards", [])
 
         if not questions_data:
             logger.warning(f"⚠️ No questions generated for subtopic '{key}' ('{topic.title}')")
@@ -2003,6 +2280,7 @@ REMINDER: The response MUST include questions for ALL {len(next_batch)} topics l
 
         logger.info(f"✅ Saving {len(questions_data)} questions for subtopic '{topic.title}'")
 
+        # Save questions
         for q_idx, q_data in enumerate(questions_data):
             # Ensure options is a list
             options = q_data.get("options", ["A", "B", "C", "D"])
@@ -2025,10 +2303,24 @@ REMINDER: The response MUST include questions for ALL {len(next_batch)} topics l
             db.add(question)
             total_questions_generated += 1
 
+        # Save flashcards
+        if flashcards_data:
+            logger.info(f"💳 Saving {len(flashcards_data)} flashcards for subtopic '{topic.title}'")
+            for f_idx, f_data in enumerate(flashcards_data):
+                flashcard = Flashcard(
+                    topic_id=topic.id,
+                    front=f_data.get("front", ""),
+                    back=f_data.get("back", ""),
+                    hint=f_data.get("hint"),
+                    order_index=f_idx
+                )
+                db.add(flashcard)
+                total_flashcards_generated += 1
+
     # Commit to database
     try:
         db.commit()
-        logger.info(f"✅ Successfully saved {total_questions_generated} questions to database")
+        logger.info(f"✅ Successfully saved {total_questions_generated} questions and {total_flashcards_generated} flashcards to database")
     except Exception as e:
         db.rollback()
         logger.error(f"❌ Failed to save questions: {e}")
@@ -2037,16 +2329,329 @@ REMINDER: The response MUST include questions for ALL {len(next_batch)} topics l
     # Count remaining subtopics without questions
     remaining_count = len(subtopics_without_questions) - len(next_batch)
 
-    logger.info(f"✅ Generated {total_questions_generated} questions for {len(next_batch)} subtopics")
+    logger.info(f"✅ Generated {total_questions_generated} questions and {total_flashcards_generated} flashcards for {len(next_batch)} subtopics")
     logger.info(f"📊 Remaining subtopics without questions: {remaining_count}")
 
     return {
         "message": f"Successfully generated questions for {len(next_batch)} subtopics",
         "generated": len(next_batch),
         "totalQuestions": total_questions_generated,
+        "totalFlashcards": total_flashcards_generated,
         "remaining": remaining_count,
         "hasMore": remaining_count > 0
     }
+
+
+@router.get("/{session_id}/generate-more-questions-stream")
+async def generate_more_questions_stream(
+    session_id: str,
+    token: str,  # Token from query param (EventSource doesn't support headers)
+    db: Session = Depends(get_db),
+):
+    """
+    Stream question generation progress using Server-Sent Events (SSE).
+
+    This endpoint streams real-time progress updates as questions are generated
+    for remaining topics without questions. Uses DeepSeek API exclusively for
+    cost optimization.
+
+    SSE Events:
+    - start: Initial connection with total topics remaining
+    - batch_start: Before each batch generation
+    - progress: After each batch completes (with detailed stats)
+    - complete: When all questions are generated
+    - error: If any error occurs
+    """
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        """Generate Server-Sent Events as questions are created"""
+
+        try:
+            # Authenticate user from token (EventSource doesn't support headers)
+            from app.core.security import decode_access_token
+
+            try:
+                payload = decode_access_token(token)
+                user_id = int(payload.get("sub"))
+
+                current_user = db.query(User).filter(User.id == user_id).first()
+                if not current_user or not current_user.is_active:
+                    yield f"event: error\ndata: {json.dumps({'error': 'Authentication failed'})}\n\n"
+                    return
+            except Exception as auth_error:
+                logger.error(f"❌ SSE authentication failed: {auth_error}")
+                yield f"event: error\ndata: {json.dumps({'error': 'Invalid authentication token'})}\n\n"
+                return
+
+            # Validate UUID
+            try:
+                uuid_obj = uuid.UUID(session_id)
+            except ValueError:
+                yield f"event: error\ndata: {json.dumps({'error': 'Invalid session ID format'})}\n\n"
+                return
+
+            # Fetch session
+            session = db.query(StudySession).filter(
+                StudySession.id == uuid_obj,
+                StudySession.user_id == current_user.id
+            ).first()
+
+            if not session:
+                yield f"event: error\ndata: {json.dumps({'error': 'Study session not found'})}\n\n"
+                return
+
+            # Find topics without questions (optimized query)
+            question_counts_subquery = db.query(
+                Question.topic_id,
+                func.count(Question.id).label('question_count')
+            ).group_by(Question.topic_id).subquery()
+
+            topics_with_counts = db.query(
+                Topic,
+                func.coalesce(question_counts_subquery.c.question_count, 0).label('question_count')
+            ).outerjoin(
+                question_counts_subquery,
+                Topic.id == question_counts_subquery.c.topic_id
+            ).filter(
+                Topic.study_session_id == uuid_obj
+            ).order_by(Topic.order_index).all()
+
+            subtopics_without_questions = [
+                topic for topic, count in topics_with_counts if count == 0
+            ]
+
+            if not subtopics_without_questions:
+                logger.info(f"✅ All subtopics already have questions for session {session_id}")
+                yield f"event: complete\ndata: {json.dumps({'message': 'All topics already have questions', 'generated': 0, 'remaining': 0})}\n\n"
+                return
+
+            total_remaining = len(subtopics_without_questions)
+            logger.info(f"📊 Found {total_remaining} topics without questions")
+
+            # Send start event
+            yield f"event: start\ndata: {json.dumps({'totalRemaining': total_remaining, 'sessionId': session_id})}\n\n"
+
+            # Extract text from file (needed for AI generation)
+            if not session.file_content:
+                yield f"event: error\ndata: {json.dumps({'error': 'No file content available'})}\n\n"
+                return
+
+            extracted_text, _, _ = detect_file_type_and_extract(session.file_content)
+
+            # Initialize DeepSeek client (ALWAYS use DeepSeek for cost optimization)
+            deepseek_client = OpenAI(
+                api_key=settings.DEEPSEEK_API_KEY,
+                base_url="https://api.deepseek.com"
+            )
+            logger.info("⏱️ Using DeepSeek for incremental question generation (SSE stream)")
+
+            # Generate in batches
+            BATCH_SIZE = 2
+            batch_num = 0
+            total_questions_all_batches = 0
+            total_flashcards_all_batches = 0
+
+            while subtopics_without_questions:
+                next_batch = subtopics_without_questions[:BATCH_SIZE]
+                batch_num += 1
+
+                logger.info(f"🔄 SSE Stream - Batch {batch_num}: Generating for {len(next_batch)} topics")
+
+                # Send batch start event
+                batch_start_data = {'batchNumber': batch_num, 'topicsInBatch': len(next_batch)}
+                yield f"event: batch_start\ndata: {json.dumps(batch_start_data)}\n\n"
+
+                # Build prompt for this batch
+                subtopics_list = ""
+                subtopic_map = {}
+
+                for topic in next_batch:
+                    parent = db.query(Topic).filter(Topic.id == topic.parent_topic_id).first()
+                    category_title = parent.title if parent else "General"
+                    key = f"topic-{topic.id}"
+                    subtopic_map[key] = topic
+                    topic_type = "CATEGORY (overview/synthesis questions)" if topic.is_category else "SPECIFIC TOPIC (detailed questions)"
+
+                    subtopics_list += f"\n[Topic {key}]\n"
+                    subtopics_list += f"Title: {topic.title}\n"
+                    subtopics_list += f"Description: {topic.description or ''}\n"
+                    subtopics_list += f"Type: {topic_type}\n"
+                    if parent:
+                        subtopics_list += f"Parent Category: {category_title}\n"
+
+                # Build AI prompt (same as generate-more-questions)
+                batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions AND flashcards for EACH of the following topics from the study material.
+
+CRITICAL: Generate comprehensive questions and flashcards for all topics:
+- Extract EVERY testable concept, fact, principle, detail, definition, example, and implication from the material
+- Generate 15-20 high-quality questions per topic (reduced from 25-35 to fit within API token limits)
+- Generate 8-12 flashcards per topic for spaced repetition learning
+
+Study Material:
+{extracted_text[:80000]}
+
+TOPICS TO COVER ({len(next_batch)} topics in this batch):
+{subtopics_list}
+
+Requirements:
+1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch of 2 topics)
+2. Generate 8-12 flashcards for EACH topic for spaced repetition review
+3. Each question must have exactly 4 PLAUSIBLE options
+4. Provide detailed explanations
+5. Include source text from the study material
+6. Return ONLY valid JSON - NO MARKDOWN, NO CODE BLOCKS, NO EXTRA TEXT
+
+IMPORTANT INSTRUCTIONS:
+- DO NOT ASK ANY QUESTIONS - you have all the information you need
+- DO NOT SAY "I understand" or "I'll help" or provide ANY explanations
+- YOUR FIRST CHARACTER MUST BE: {{
+- OUTPUT ONLY THE JSON OBJECT - NOTHING ELSE
+
+Return in this EXACT format:
+{{
+  "subtopics": {{
+    "topic-123": {{
+      "questions": [/* 25-35 questions */],
+      "flashcards": [/* 10-15 flashcards */]
+    }}
+  }}
+}}"""
+
+                try:
+                    # Call DeepSeek API
+                    batch_response = deepseek_client.chat.completions.create(
+                        model="deepseek-chat",
+                        max_tokens=8192,
+                        temperature=0.7,
+                        messages=[{"role": "user", "content": batch_prompt}]
+                    )
+                    batch_text = batch_response.choices[0].message.content
+
+                    # Parse JSON response
+                    start_idx = batch_text.find('{')
+                    end_idx = batch_text.rfind('}') + 1
+
+                    if start_idx == -1 or end_idx == 0:
+                        logger.error(f"❌ No JSON found in AI response")
+                        error_data = {'error': 'AI returned non-JSON response', 'batch': batch_num}
+                        yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
+                        break
+
+                    json_str = batch_text[start_idx:end_idx]
+                    batch_json = json.loads(json_str)
+                    subtopics_questions = batch_json.get("subtopics", {})
+
+                    # Save questions and flashcards
+                    total_questions_generated = 0
+                    total_flashcards_generated = 0
+
+                    for key, topic in subtopic_map.items():
+                        questions_data = subtopics_questions.get(key, {}).get("questions", [])
+                        flashcards_data = subtopics_questions.get(key, {}).get("flashcards", [])
+
+                        # Save questions
+                        for q_idx, q_data in enumerate(questions_data):
+                            options = q_data.get("options", ["A", "B", "C", "D"])
+                            if isinstance(options, str):
+                                try:
+                                    options = json.loads(options)
+                                except:
+                                    options = ["Option A", "Option B", "Option C", "Option D"]
+
+                            question = Question(
+                                topic_id=topic.id,
+                                question=q_data.get("question", f"Question {q_idx+1}"),
+                                options=options,
+                                correct_answer=q_data.get("correctAnswer", 0),
+                                explanation=q_data.get("explanation", ""),
+                                source_text=q_data.get("sourceText"),
+                                source_page=q_data.get("sourcePage"),
+                                order_index=q_idx
+                            )
+                            db.add(question)
+                            total_questions_generated += 1
+
+                        # Save flashcards
+                        if flashcards_data:
+                            for f_idx, f_data in enumerate(flashcards_data):
+                                flashcard = Flashcard(
+                                    topic_id=topic.id,
+                                    front=f_data.get("front", ""),
+                                    back=f_data.get("back", ""),
+                                    hint=f_data.get("hint"),
+                                    order_index=f_idx
+                                )
+                                db.add(flashcard)
+                                total_flashcards_generated += 1
+
+                    db.commit()
+                    logger.info(f"💾 Database committed - {total_questions_generated}Q and {total_flashcards_generated}F saved")
+
+                    # Log which topics got questions
+                    for key, topic in subtopic_map.items():
+                        q_count = len(subtopics_questions.get(key, {}).get("questions", []))
+                        f_count = len(subtopics_questions.get(key, {}).get("flashcards", []))
+                        logger.info(f"   📝 Topic ID {topic.id} '{topic.title}': {q_count}Q, {f_count}F")
+
+                    # Update counters
+                    total_questions_all_batches += total_questions_generated
+                    total_flashcards_all_batches += total_flashcards_generated
+
+                    # Remove processed topics
+                    subtopics_without_questions = subtopics_without_questions[BATCH_SIZE:]
+                    remaining_count = len(subtopics_without_questions)
+
+                    # Send progress event
+                    progress_data = {
+                        'batchNumber': batch_num,
+                        'generated': len(next_batch),
+                        'remaining': remaining_count,
+                        'totalQuestions': total_questions_generated,
+                        'totalFlashcards': total_flashcards_generated,
+                        'cumulativeQuestions': total_questions_all_batches,
+                        'cumulativeFlashcards': total_flashcards_all_batches,
+                        'hasMore': remaining_count > 0
+                    }
+
+                    logger.info(f"✅ SSE Stream - Batch {batch_num} complete: {total_questions_generated}Q, {total_flashcards_generated}F. Remaining: {remaining_count}")
+                    logger.info(f"📡 Sending progress event to frontend: {progress_data}")
+                    yield f"event: progress\ndata: {json.dumps(progress_data)}\n\n"
+
+                    # Small delay between batches
+                    await asyncio.sleep(0.5)
+
+                except Exception as e:
+                    logger.error(f"❌ SSE Stream - Batch {batch_num} failed: {e}")
+                    error_data = {'error': str(e), 'batch': batch_num}
+                    yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
+                    break
+
+            # Send completion event
+            completion_data = {
+                'message': 'All questions generated successfully',
+                'totalQuestions': total_questions_all_batches,
+                'totalFlashcards': total_flashcards_all_batches,
+                'batchesCompleted': batch_num
+            }
+            logger.info(f"🎉 SSE Stream complete: {total_questions_all_batches}Q, {total_flashcards_all_batches}F")
+            yield f"event: complete\ndata: {json.dumps(completion_data)}\n\n"
+
+        except Exception as e:
+            import traceback
+            logger.error(f"❌ SSE stream error: {e}")
+            logger.error(f"❌ Traceback: {traceback.format_exc()}")
+            error_data = {'error': str(e)}
+            yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+            "Connection": "keep-alive",
+        }
+    )
 
 
 @router.delete("/{session_id}")
@@ -2183,6 +2788,12 @@ async def update_topic_progress(
     topic.current_question_index = data.current_question_index
     topic.completed = data.completed
 
+    # Handle workflow stage transitions
+    # When quiz is completed, transition to flashcard_review stage
+    if data.completed and topic.workflow_stage == "quiz_available":
+        topic.workflow_stage = "flashcard_review"
+        logger.info(f"✅ Quiz completed for topic {topic_id} ({topic.title}) - transitioning to flashcard_review stage")
+
     # Update session progress (percentage of completed subtopics)
     all_topics = db.query(Topic).filter(
         Topic.study_session_id == uuid_obj,
@@ -2202,6 +2813,7 @@ async def update_topic_progress(
         "score": topic.score,
         "current_question_index": topic.current_question_index,
         "completed": topic.completed,
+        "workflow_stage": topic.workflow_stage,
         "session_progress": session.progress
     }
 
@@ -2489,6 +3101,82 @@ async def submit_flashcard_review(
     }
 
 
+@router.post("/topics/{topic_id}/flashcards/complete")
+async def mark_flashcards_complete(
+    topic_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Mark all flashcards for a topic as completed.
+
+    This endpoint is called when the user finishes reviewing all flashcards
+    for a topic. It:
+    1. Updates the topic's workflow_stage to "completed"
+    2. Unlocks next topics (topics that have this topic as a prerequisite)
+
+    This is the final step in the workflow: quiz → flashcards → complete
+
+    Returns:
+        Success status and list of newly unlocked topics
+    """
+    # Verify topic exists and belongs to user's session
+    topic = db.query(Topic).join(StudySession).filter(
+        Topic.id == topic_id,
+        StudySession.user_id == current_user.id
+    ).first()
+
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+    # Update topic workflow stage to completed
+    topic.workflow_stage = "completed"
+    topic.completed = True
+
+    logger.info(f"✅ Topic {topic_id} ({topic.title}) marked as completed (flashcards done)")
+
+    # Unlock next topics (topics that have this topic as a prerequisite)
+    unlocked_topics = []
+
+    # Find all topics that have this topic in their prerequisites
+    dependent_topics = db.query(Topic).filter(
+        Topic.study_session_id == topic.study_session_id,
+        Topic.prerequisite_topic_ids.contains([topic_id])  # PostgreSQL array contains
+    ).all()
+
+    for dependent in dependent_topics:
+        # Check if ALL prerequisites are now completed
+        if dependent.prerequisite_topic_ids:
+            prerequisites = db.query(Topic).filter(
+                Topic.id.in_(dependent.prerequisite_topic_ids)
+            ).all()
+
+            all_prerequisites_completed = all(
+                prereq.workflow_stage == "completed"
+                for prereq in prerequisites
+            )
+
+            if all_prerequisites_completed and dependent.workflow_stage == "locked":
+                # Unlock this topic!
+                dependent.workflow_stage = "quiz_available"
+                unlocked_topics.append({
+                    "topic_id": dependent.id,
+                    "title": dependent.title
+                })
+                logger.info(f"🔓 Unlocked topic {dependent.id} ({dependent.title}) - all prerequisites completed")
+
+    db.commit()
+
+    return {
+        "success": True,
+        "topic_id": topic_id,
+        "title": topic.title,
+        "workflow_stage": "completed",
+        "unlocked_topics": unlocked_topics,
+        "unlocked_count": len(unlocked_topics)
+    }
+
+
 # ===== WORKFLOW VISUALIZATION ENDPOINT =====
 
 @router.get("/sessions/{session_id}/workflow")
@@ -2534,17 +3222,47 @@ async def get_session_workflow(
         Topic.study_session_id == uuid_obj
     ).group_by(Topic.id).all()
 
-    # Build workflow nodes
+    # Get all game completions for this user and session's topics
+    topic_ids = [topic.id for topic, _, _ in topics]
+    game_completions = db.query(GameCompletion).filter(
+        GameCompletion.user_id == current_user.id,
+        GameCompletion.topic_id.in_(topic_ids)
+    ).all()
+
+    # Create a map of topic_id -> list of game completions
+    games_by_topic = {}
+    for gc in game_completions:
+        if gc.topic_id not in games_by_topic:
+            games_by_topic[gc.topic_id] = []
+        games_by_topic[gc.topic_id].append({
+            "game_type": gc.game_type,
+            "completed": gc.completed,
+            "score": gc.score
+        })
+
+    # Build workflow nodes (topics + games)
     workflow_nodes = []
+    game_nodes = []
+
     for topic, question_count, flashcard_count in topics:
+        workflow_stage = topic.workflow_stage or "locked"
+
+        # Helper fields for frontend (derived from workflow_stage)
+        quiz_completed = workflow_stage in ["quiz_completed", "flashcard_review", "completed"]
+        flashcards_completed = workflow_stage == "completed"
+
+        # Games are recommended when flashcards are completed
+        games_available = flashcards_completed
+
         node = {
+            "node_type": "topic",  # Distinguish from game nodes
             "topic_id": topic.id,
             "title": topic.title,
             "description": topic.description,
             "is_category": topic.is_category,
             "parent_topic_id": topic.parent_topic_id,
             "order_index": topic.order_index,
-            "workflow_stage": topic.workflow_stage or "locked",
+            "workflow_stage": workflow_stage,
             "position_x": topic.position_x,
             "position_y": topic.position_y,
             "prerequisite_topic_ids": topic.prerequisite_topic_ids or [],
@@ -2552,14 +3270,63 @@ async def get_session_workflow(
             "flashcard_count": flashcard_count,
             "completed": topic.completed,
             "score": topic.score,
-            "current_question_index": topic.current_question_index
+            "current_question_index": topic.current_question_index,
+
+            # Helper fields for frontend React Flow implementation
+            "quiz_completed": quiz_completed,  # True if quiz is done (flashcards now available)
+            "flashcards_completed": flashcards_completed,  # True if flashcards are done (topic fully completed)
+            "games_available": games_available,  # True if games are recommended
+
+            # Game completion info for this topic
+            "games": games_by_topic.get(topic.id, [])
         }
         workflow_nodes.append(node)
+
+        # Add game nodes for completed topics
+        if games_available and not topic.is_category:
+            # Recommend primary games (Memory Match and True/False)
+            primary_games = [
+                {
+                    "game_type": "memory_match",
+                    "title": "🧠 Memory Match",
+                    "description": "Match concepts and definitions",
+                    "icon": "🧠"
+                },
+                {
+                    "game_type": "true_false",
+                    "title": "✓ True or False",
+                    "description": "Test your knowledge with scenarios",
+                    "icon": "✓"
+                }
+            ]
+
+            for game_info in primary_games:
+                # Check if this game has been completed
+                completed_game = next(
+                    (g for g in games_by_topic.get(topic.id, []) if g['game_type'] == game_info['game_type']),
+                    None
+                )
+
+                game_node = {
+                    "node_type": "game",
+                    "game_type": game_info['game_type'],
+                    "title": game_info['title'],
+                    "description": game_info['description'],
+                    "icon": game_info['icon'],
+                    "topic_id": topic.id,  # Link back to parent topic
+                    "topic_title": topic.title,
+                    "completed": completed_game['completed'] if completed_game else False,
+                    "score": completed_game['score'] if completed_game and completed_game['completed'] else None,
+                    "workflow_stage": "available",  # Games are always available once unlocked
+                }
+                game_nodes.append(game_node)
 
     return {
         "session_id": str(session.id),
         "title": session.title,
         "progress": session.progress,
-        "workflow_nodes": workflow_nodes,
-        "total_nodes": len(workflow_nodes)
+        "workflow_nodes": workflow_nodes,  # Topic nodes
+        "game_nodes": game_nodes,  # Game nodes (separate for easier frontend rendering)
+        "total_nodes": len(workflow_nodes),
+        "total_games": len(game_nodes)
     }
