@@ -2585,7 +2585,9 @@ Return in this EXACT format:
             yield f"event: complete\ndata: {json.dumps(completion_data)}\n\n"
 
         except Exception as e:
+            import traceback
             logger.error(f"❌ SSE stream error: {e}")
+            logger.error(f"❌ Traceback: {traceback.format_exc()}")
             yield f"event: error\ndata: {json.dumps({{'error': str(e)}})}\n\n"
 
     return StreamingResponse(
