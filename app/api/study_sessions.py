@@ -1229,8 +1229,8 @@ TOPICS TO COVER ({len(batch_keys)} topics in this batch):
 {subtopics_list}
 
 Requirements:
-1. Generate 25-35 high-quality questions for EACH topic (total ~50-70 questions for this batch)
-2. Generate 10-15 flashcards for EACH topic for spaced repetition review
+1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch of 2 topics)
+2. Generate 8-12 flashcards for EACH topic for spaced repetition review
 3. Extract the MOST IMPORTANT testable information from the study material
 3. NO DUPLICATES - each question must test a unique concept or angle
 4. For EACH topic, include multiple EXAMPLE-BASED questions (e.g., "Which scenario is an example of operant conditioning?")
@@ -1280,7 +1280,7 @@ CRITICAL REQUIREMENTS:
 - You MUST generate questions AND flashcards for EVERY SINGLE topic key listed above - NO EXCEPTIONS
 - If a topic is listed, it MUST appear in your JSON response with questions AND flashcards
 - Missing even ONE topic key will result in incomplete learning coverage
-- Each topic MUST have 25-35 questions (aim for 35 when possible) AND 10-15 flashcards
+- Each topic MUST have 15-20 questions (aim for 20 when possible) AND 8-12 flashcards
 
 Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic listed must be in the response):
 {{
@@ -1891,10 +1891,10 @@ async def generate_more_questions(
     # Build prompt
     batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions AND flashcards for EACH of the following topics from the study material.
 
-CRITICAL: Generate the ABSOLUTE MAXIMUM number of questions and flashcards possible:
+CRITICAL: Generate comprehensive questions and flashcards for all topics:
 - Extract EVERY testable concept, fact, principle, detail, definition, example, and implication from the material
-- DO NOT impose any limits on the number of questions - generate as many as the content supports (aim for 25-35+ questions per topic)
-- Generate 10-15 flashcards per topic for spaced repetition learning
+- Generate 15-20 high-quality questions per topic (reduced from 25-35 to fit within API token limits)
+- Generate 8-12 flashcards per topic for spaced repetition learning
 - Break down EVERY concept into multiple questions from different angles
 - Test each concept in multiple ways: definition, application, comparison, analysis, synthesis, evaluation
 - Create questions for every sentence that contains testable information
@@ -1936,8 +1936,8 @@ TOPICS TO COVER ({len(next_batch)} topics in this batch):
 {subtopics_list}
 
 Requirements:
-1. Generate 25-35 high-quality questions for EACH topic (total ~50-70 questions for this batch)
-2. Generate 10-15 flashcards for EACH topic for spaced repetition review
+1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch of 2 topics)
+2. Generate 8-12 flashcards for EACH topic for spaced repetition review
 3. Extract the MOST IMPORTANT testable information from the study material
 3. NO DUPLICATES - each question must test a unique concept or angle
 4. For EACH topic, include multiple EXAMPLE-BASED questions (e.g., "Which scenario is an example of...?")
@@ -1972,10 +1972,10 @@ YOU MUST START YOUR RESPONSE WITH THIS EXACT CHARACTER: {{
 
 Begin JSON output now:
 
-GOAL: Create 25-35 comprehensive questions AND 10-15 flashcards per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
+GOAL: Create 15-20 comprehensive questions AND 8-12 flashcards per topic. Focus on QUALITY and coverage of core concepts. Include example-based questions for key concepts.
 
 FLASHCARD REQUIREMENTS:
-- Generate 10-15 flashcards per topic for post-quiz review
+- Generate 8-12 flashcards per topic for post-quiz review
 - Flashcards should cover KEY DEFINITIONS, CONCEPTS, and TERMS
 - Front: Question or term (concise, clear)
 - Back: Answer or definition (comprehensive but digestible)
@@ -1986,7 +1986,7 @@ CRITICAL REQUIREMENTS:
 - You MUST generate questions AND flashcards for EVERY SINGLE topic key listed above - NO EXCEPTIONS
 - If a topic is listed, it MUST appear in your JSON response with questions AND flashcards
 - Missing even ONE topic key will result in incomplete learning coverage
-- Each topic MUST have 25-35 questions (aim for 35 when possible) AND 10-15 flashcards
+- Each topic MUST have 15-20 questions (aim for 20 when possible) AND 8-12 flashcards
 
 Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic listed must be in the response):
 {{
@@ -2001,7 +2001,7 @@ Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic
           "sourceText": "The complete sentence or paragraph from the study material with context.",
           "sourcePage": null
         }},
-        ... (25-35 questions for topic "topic-123")
+        ... (15-20 questions for topic "topic-123")
       ],
       "flashcards": [
         {{
@@ -2009,17 +2009,17 @@ Return in this EXACT format (use topic keys EXACTLY as shown above - EVERY topic
           "back": "X is defined as...",
           "hint": "Remember: X starts with..."
         }},
-        ... (10-15 flashcards for topic "topic-123")
+        ... (8-12 flashcards for topic "topic-123")
       ]
     }},
     "topic-456": {{
       "questions": [
         {{question object}},
-        ... (25-35 questions for topic "topic-456")
+        ... (15-20 questions for topic "topic-456")
       ],
       "flashcards": [
         {{flashcard object}},
-        ... (10-15 flashcards for topic "topic-456")
+        ... (8-12 flashcards for topic "topic-456")
       ]
     }},
     ... (MUST include ALL topic keys from the list above)
@@ -2054,6 +2054,22 @@ REMINDER: The response MUST include questions AND flashcards for ALL {len(next_b
                 messages=[{"role": "user", "content": batch_prompt}]
             )
             batch_text = batch_response.choices[0].message.content
+
+            # Check for truncation in DeepSeek response
+            finish_reason = batch_response.choices[0].finish_reason
+            logger.info(f"📊 DeepSeek response stats: finish_reason={finish_reason}, prompt_tokens={batch_response.usage.prompt_tokens}, completion_tokens={batch_response.usage.completion_tokens}")
+
+            if finish_reason == "length":
+                logger.error(f"❌ DeepSeek response TRUNCATED - hit max_tokens limit!")
+                logger.error(f"❌ Response was cut off at {batch_response.usage.completion_tokens} tokens")
+                logger.error(f"❌ Last 500 chars of truncated response: ...{batch_text[-500:]}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"AI response was truncated at token limit. Please reduce the number of topics or questions per batch."
+                )
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as api_error:
         logger.error(f"❌ AI API call failed: {type(api_error).__name__}: {str(api_error)}")
         raise HTTPException(status_code=500, detail=f"AI API error: {str(api_error)}")
@@ -2324,10 +2340,10 @@ async def generate_more_questions_stream(
                 # Build AI prompt (same as generate-more-questions)
                 batch_prompt = f"""Generate TRICKY and CHALLENGING multiple-choice questions AND flashcards for EACH of the following topics from the study material.
 
-CRITICAL: Generate the ABSOLUTE MAXIMUM number of questions and flashcards possible:
+CRITICAL: Generate comprehensive questions and flashcards for all topics:
 - Extract EVERY testable concept, fact, principle, detail, definition, example, and implication from the material
-- DO NOT impose any limits on the number of questions - generate as many as the content supports (aim for 25-35+ questions per topic)
-- Generate 10-15 flashcards per topic for spaced repetition learning
+- Generate 15-20 high-quality questions per topic (reduced from 25-35 to fit within API token limits)
+- Generate 8-12 flashcards per topic for spaced repetition learning
 
 Study Material:
 {extracted_text[:80000]}
@@ -2336,8 +2352,8 @@ TOPICS TO COVER ({len(next_batch)} topics in this batch):
 {subtopics_list}
 
 Requirements:
-1. Generate 25-35 high-quality questions for EACH topic (total ~50-70 questions for this batch)
-2. Generate 10-15 flashcards for EACH topic for spaced repetition review
+1. Generate 15-20 high-quality questions for EACH topic (total ~30-40 questions for this batch of 2 topics)
+2. Generate 8-12 flashcards for EACH topic for spaced repetition review
 3. Each question must have exactly 4 PLAUSIBLE options
 4. Provide detailed explanations
 5. Include source text from the study material

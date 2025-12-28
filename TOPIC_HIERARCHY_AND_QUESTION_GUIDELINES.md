@@ -6,7 +6,7 @@ This document defines the **strict requirements** for topic hierarchy structure 
 
 1. **Clear hierarchical flow** - Topic → Subtopic → Further Subtopic
 2. **No overlapping subtopics** - Each subtopic is distinct and focused
-3. **Sufficient questions per topic** - Every leaf node has 25-35 quality questions
+3. **Sufficient questions per topic** - Every leaf node has 15-20 quality questions
 4. **Proper organization** - Foundation first, building to advanced concepts
 
 ---
@@ -148,12 +148,12 @@ Memory Systems
 
 ### Minimum Questions Per Leaf Topic
 
-**EVERY leaf topic MUST have 25-35 high-quality questions.**
+**EVERY leaf topic MUST have 15-20 high-quality questions.**
 
 **Formula:**
 ```
-Leaf Topic Questions = 25-35 questions
-  ├─ Multiple Choice: All 25-35
+Leaf Topic Questions = 15-20 questions
+  ├─ Multiple Choice: All 15-20
   ├─ 4 plausible options each
   └─ Detailed explanations with source text
 ```
@@ -181,7 +181,7 @@ Sample Questions for Category:
 3. "What is the relationship between stress prevention and coping strategies?"
 ```
 
-**Requirement:** 25-35 synthesis questions
+**Requirement:** 15-20 synthesis questions
 
 #### 2. Leaf Topics (No Children)
 
@@ -205,7 +205,7 @@ Sample Questions:
 4. "Which of the following is NOT a problem-focused coping strategy?"
 ```
 
-**Requirement:** 25-35 detailed questions
+**Requirement:** 15-20 detailed questions
 
 ### Question Quality Standards
 
@@ -300,7 +300,7 @@ Communication Skills
 1. Create approximately {num_categories} major categories
 2. Within each category, break down into focused subtopics (2-3 levels maximum)
 3. Prioritize QUALITY over excessive nesting
-4. Each leaf node should support 5-15 quality questions  # TODO: Update to 25-35
+4. Each leaf node should support 15-20 quality questions
 5. Clear titles and descriptions at ALL levels
 6. Organize logically (foundational → advanced)
 7. Approximately {initial_topics} total LEAF topics
@@ -321,7 +321,7 @@ CRITICAL HIERARCHY RULES:
 2. PROPER CONTAINMENT - Child topics must be fully contained within parent scope
    Example: Under "Emotional Intelligence", don't include "Time Management"
 
-3. APPROPRIATE GRANULARITY - Each leaf topic must support 25-35 quality questions
+3. APPROPRIATE GRANULARITY - Each leaf topic must support 15-20 quality questions
    Example: Don't create "Definition of X" as a topic - too narrow (only 1-2 questions)
 
 4. SUBJECT FLOW - Organize within same subject domain
@@ -329,7 +329,7 @@ CRITICAL HIERARCHY RULES:
 
 5. VALIDATE BEFORE RETURNING:
    - Check each sibling pair for overlap
-   - Ensure each leaf can generate 25-35 questions
+   - Ensure each leaf can generate 15-20 questions
    - Verify parent-child containment
    - Confirm proper depth (max 3 levels)
 ```
@@ -356,7 +356,7 @@ CRITICAL HIERARCHY RULES:
 - [ ] Logical parent-child relationships
 
 **Granularity:**
-- [ ] Each leaf topic can generate 25-35 questions
+- [ ] Each leaf topic can generate 15-20 questions
 - [ ] Not too broad (unfocused)
 - [ ] Not too narrow (insufficient content)
 
@@ -366,7 +366,7 @@ CRITICAL HIERARCHY RULES:
 - [ ] Logical progression within subject
 
 **Questions:**
-- [ ] 25-35 questions per leaf topic
+- [ ] 15-20 questions per leaf topic
 - [ ] All questions have 4 options
 - [ ] Detailed explanations
 - [ ] Source text included
@@ -483,9 +483,9 @@ CRITICAL HIERARCHY RULES:
 {
   "title": "Memory",
   "subtopics": [
-    {"title": "Working Memory"},           // 25-35 questions possible
-    {"title": "Long-Term Memory"},         // 25-35 questions possible
-    {"title": "Sensory Memory"}            // 25-35 questions possible
+    {"title": "Working Memory"},           // 15-20 questions possible
+    {"title": "Long-Term Memory"},         // 15-20 questions possible
+    {"title": "Sensory Memory"}            // 15-20 questions possible
   ]
 }
 ```
@@ -497,7 +497,7 @@ CRITICAL HIERARCHY RULES:
 ### For Backend Developers:
 
 - [ ] Update AI prompt to include NO OVERLAP rule
-- [ ] Update AI prompt to require 25-35 questions per leaf
+- [ ] Update AI prompt to require 15-20 questions per leaf
 - [ ] Add validation after topic extraction to check for overlaps
 - [ ] Enforce max depth of 3 levels
 - [ ] Log warnings for topics with insufficient questions
@@ -606,7 +606,7 @@ Stress and Wellness (Subject)
 1. **Max 3 Levels** - No deeper nesting allowed
 2. **No Overlap** - Sibling topics must be mutually exclusive
 3. **Proper Containment** - Children must fit within parent scope
-4. **25-35 Questions** - Every leaf topic must support this many
+4. **15-20 Questions** - Every leaf topic must support this many
 5. **Logical Flow** - Foundation → Application → Advanced
 
 ### Quality Checks:
@@ -615,7 +615,7 @@ Before finalizing any topic hierarchy:
 1. Check for overlapping siblings
 2. Verify parent-child containment
 3. Confirm max depth of 3
-4. Ensure each leaf can generate 25-35 questions
+4. Ensure each leaf can generate 15-20 questions
 5. Validate logical progression
 
 ### Remember:
