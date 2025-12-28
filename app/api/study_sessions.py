@@ -849,13 +849,26 @@ Requirements:
 1. Create approximately {num_categories} major categories that organize the content at a high level
 2. Within each category, break down into focused subtopics (2-3 levels maximum)
 3. Prioritize QUALITY over excessive nesting - only create subtopics when there's sufficient content to generate meaningful questions
-4. Each leaf node should be a focused concept that can support 5-15 quality questions
+4. Each leaf node should be a focused concept that can support 25-35 quality questions
 5. Provide clear titles and brief descriptions at ALL levels
 6. Organize logically (foundational concepts first, building to advanced topics)
 7. Create approximately {initial_topics} total LEAF topics across all categories that will actually have questions
 8. Avoid creating unnecessary intermediate categories - go directly to testable concepts when possible
 9. Focus on core concepts and foundational topics first
 10. Remember: The goal is quality questions, not deep nesting
+
+CRITICAL - NO DUPLICATES:
+- NEVER create the same topic twice at any level
+- Each topic title must be unique within its sibling group
+- If a concept appears twice, consolidate it into ONE topic
+- Example: Don't create both "Workplace Stress" AND "Work-Related Stress" - they're duplicates!
+- Validate each level for duplicate titles before including in JSON
+
+CRITICAL - NO OVERLAPPING:
+- Sibling topics must be mutually exclusive (no overlap)
+- Each topic should have a distinct, focused scope
+- Example GOOD: "Verbal Communication", "Non-Verbal Communication", "Written Communication" (distinct)
+- Example BAD: "Face-to-Face Communication", "Verbal Communication", "Body Language" (overlap!)
 
 IMPORTANT: Keep the structure simple and focused. Only nest 2-3 levels deep. Empty subtopics with no questions provide no value.
 
@@ -934,6 +947,38 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
             categories_data = topics_json["categories"]
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             raise HTTPException(status_code=500, detail=f"Failed to parse topics: {str(e)}")
+
+        # CRITICAL: Deduplicate topics to prevent duplicate subtopics (e.g., same topic appearing twice)
+        def deduplicate_topics(topics_list: list) -> list:
+            """
+            Recursively deduplicate topics by title at each level.
+            Keeps the first occurrence and removes subsequent duplicates.
+            """
+            seen_titles = set()
+            deduplicated = []
+
+            for topic in topics_list:
+                title_lower = topic.get("title", "").lower().strip()
+
+                # Check if we've already seen this title at this level
+                if title_lower in seen_titles:
+                    logger.warning(f"⚠️ DUPLICATE TOPIC DETECTED: '{topic.get('title')}' - removing duplicate")
+                    continue
+
+                # Mark this title as seen
+                seen_titles.add(title_lower)
+
+                # Recursively deduplicate subtopics
+                if "subtopics" in topic and isinstance(topic["subtopics"], list):
+                    topic["subtopics"] = deduplicate_topics(topic["subtopics"])
+
+                deduplicated.append(topic)
+
+            return deduplicated
+
+        # Apply deduplication to all categories and their children
+        categories_data = deduplicate_topics(categories_data)
+        logger.info(f"✅ Deduplication complete - {len(categories_data)} unique categories")
 
         # Count total subtopics for the session
         total_subtopics = sum(len(cat.get("subtopics", [])) for cat in categories_data)
