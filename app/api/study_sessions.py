@@ -1561,13 +1561,11 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
             # Get questions for this subtopic from batch response
             questions_data = subtopics_questions.get(subtopic_key, {}).get("questions", [])
 
-            # Skip if no questions generated
+            # Skip if no questions generated (in progressive loading, this is expected for topics beyond the initial batch)
             if not questions_data:
-                # Expected to have questions for all subtopics
-                logger.warning(f"⚠️ No questions generated for subtopic '{subtopic_key}' ('{subtopic.title}') - SKIPPING (may lack relevant content in document)")
-                # If this is a sub-subtopic without questions, still add it to parent
-                if "subtopic_schema" in subtopic_info:
-                    parent_schema.subtopics.append(subtopic_schema)
+                logger.info(f"⏭️ No questions for subtopic '{subtopic_key}' ('{subtopic.title}') - will be generated later via SSE")
+                # Note: The topic is already in the parent's subtopics list (added during creation)
+                # It just has an empty questions array, which will be populated later
                 continue
             else:
                 logger.info(f"✅ Found {len(questions_data)} questions for subtopic '{subtopic_key}' ('{subtopic.title}')")
@@ -1642,10 +1640,9 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
                     db.add(flashcard)
 
             # Update subtopic schema with questions
+            # Note: subtopic_schema is already in parent's subtopics list (added during creation at line 1212)
+            # We're just updating the questions property of the existing schema object
             subtopic_schema.questions = questions_list
-            # Add to parent (either category or parent subtopic)
-            if parent_schema:
-                parent_schema.subtopics.append(subtopic_schema)
 
         # Validate that questions were generated for a reasonable number of subtopics
         subtopics_with_questions = len([k for k, v in subtopics_questions.items() if v.get("questions")])
@@ -1742,6 +1739,22 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
 
         # Calculate how many topics don't have questions yet (for progressive loading)
         topics_without_questions = len(all_subtopic_keys) - len(subtopics_to_generate)
+
+        # Log summary of what's being returned
+        logger.info(f"📊 RESPONSE SUMMARY:")
+        logger.info(f"  ✅ Generated {question_counter} total questions for {len(subtopics_to_generate)} topics")
+        logger.info(f"  📡 {topics_without_questions} topics remaining (will be loaded via SSE)")
+
+        # Count questions in response for verification
+        def count_questions_recursive(topic_list):
+            total = 0
+            for topic in topic_list:
+                total += len(topic.questions)
+                total += count_questions_recursive(topic.subtopics)
+            return total
+
+        questions_in_response = count_questions_recursive(all_topics)
+        logger.info(f"  📋 Response includes {questions_in_response} questions in topic tree")
 
         # Handle both Pydantic model and dict access patterns (defensive coding)
         progressive_load_value = data.progressive_load if hasattr(data, 'progressive_load') else data.get('progressive_load', False)
