@@ -2417,7 +2417,8 @@ async def generate_more_questions_stream(
                 logger.info(f"🔄 SSE Stream - Batch {batch_num}: Generating for {len(next_batch)} topics")
 
                 # Send batch start event
-                yield f"event: batch_start\ndata: {json.dumps({{'batchNumber': batch_num, 'topicsInBatch': len(next_batch)}})}\n\n"
+                batch_start_data = {'batchNumber': batch_num, 'topicsInBatch': len(next_batch)}
+                yield f"event: batch_start\ndata: {json.dumps(batch_start_data)}\n\n"
 
                 # Build prompt for this batch
                 subtopics_list = ""
@@ -2491,7 +2492,8 @@ Return in this EXACT format:
 
                     if start_idx == -1 or end_idx == 0:
                         logger.error(f"❌ No JSON found in AI response")
-                        yield f"event: error\ndata: {json.dumps({{'error': 'AI returned non-JSON response', 'batch': batch_num}})}\n\n"
+                        error_data = {'error': 'AI returned non-JSON response', 'batch': batch_num}
+                        yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
                         break
 
                     json_str = batch_text[start_idx:end_idx]
@@ -2571,7 +2573,8 @@ Return in this EXACT format:
 
                 except Exception as e:
                     logger.error(f"❌ SSE Stream - Batch {batch_num} failed: {e}")
-                    yield f"event: error\ndata: {json.dumps({{'error': str(e), 'batch': batch_num}})}\n\n"
+                    error_data = {'error': str(e), 'batch': batch_num}
+                    yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
                     break
 
             # Send completion event
@@ -2588,7 +2591,8 @@ Return in this EXACT format:
             import traceback
             logger.error(f"❌ SSE stream error: {e}")
             logger.error(f"❌ Traceback: {traceback.format_exc()}")
-            yield f"event: error\ndata: {json.dumps({{'error': str(e)}})}\n\n"
+            error_data = {'error': str(e)}
+            yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
 
     return StreamingResponse(
         event_generator(),
