@@ -1923,7 +1923,8 @@ async def get_study_session(
         topics=total_subtopics,
         hasFullStudy=session.has_full_study or False,
         hasSpeedRun=session.has_speed_run or False,
-        createdAt=int(session.created_at.timestamp() * 1000) if session.created_at else None
+        createdAt=int(session.created_at.timestamp() * 1000) if session.created_at else None,
+        redirectUrl=f"/dashboard/{session.id}/full-study"  # Explicit redirect path for frontend
     )
 
 
