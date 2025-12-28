@@ -949,36 +949,115 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
             raise HTTPException(status_code=500, detail=f"Failed to parse topics: {str(e)}")
 
         # CRITICAL: Deduplicate topics to prevent duplicate subtopics (e.g., same topic appearing twice)
-        def deduplicate_topics(topics_list: list) -> list:
+        def deduplicate_topics(topics_list: list, parent_title: str = "ROOT", level: int = 0) -> tuple:
             """
             Recursively deduplicate topics by title at each level.
-            Keeps the first occurrence and removes subsequent duplicates.
+            Keeps the first occurrence and removes subsequent duplicates (including all their subtopics).
+
+            Args:
+                topics_list: List of topic dictionaries to deduplicate
+                parent_title: Title of parent topic for logging context
+                level: Current nesting level for logging
+
+            Returns:
+                Tuple of (deduplicated_list, duplicate_count)
             """
             seen_titles = set()
             deduplicated = []
+            duplicates_removed = 0
 
-            for topic in topics_list:
-                title_lower = topic.get("title", "").lower().strip()
+            for idx, topic in enumerate(topics_list):
+                title = topic.get("title", "").strip()
+                title_lower = title.lower()
 
                 # Check if we've already seen this title at this level
                 if title_lower in seen_titles:
-                    logger.warning(f"⚠️ DUPLICATE TOPIC DETECTED: '{topic.get('title')}' - removing duplicate")
+                    # Count subtopics that will be removed along with duplicate
+                    subtopic_count = len(topic.get("subtopics", []))
+                    logger.warning(
+                        f"{'  ' * level}⚠️ DUPLICATE REMOVED at level {level}: "
+                        f"'{title}' (duplicate #{idx + 1}) under '{parent_title}'"
+                    )
+                    if subtopic_count > 0:
+                        logger.warning(
+                            f"{'  ' * level}   └─ Also removing {subtopic_count} subtopic(s) under duplicate '{title}'"
+                        )
+                    duplicates_removed += 1
                     continue
 
-                # Mark this title as seen
+                # Mark this title as seen at this level
                 seen_titles.add(title_lower)
 
                 # Recursively deduplicate subtopics
                 if "subtopics" in topic and isinstance(topic["subtopics"], list):
-                    topic["subtopics"] = deduplicate_topics(topic["subtopics"])
+                    topic["subtopics"], child_duplicates = deduplicate_topics(
+                        topic["subtopics"],
+                        parent_title=title,
+                        level=level + 1
+                    )
+                    duplicates_removed += child_duplicates
 
                 deduplicated.append(topic)
 
-            return deduplicated
+            return deduplicated, duplicates_removed
 
         # Apply deduplication to all categories and their children
-        categories_data = deduplicate_topics(categories_data)
-        logger.info(f"✅ Deduplication complete - {len(categories_data)} unique categories")
+        logger.info("🔍 Starting deduplication check across all topic levels...")
+        categories_data, total_duplicates = deduplicate_topics(categories_data, parent_title="ROOT", level=0)
+
+        if total_duplicates > 0:
+            logger.warning(f"⚠️ REMOVED {total_duplicates} DUPLICATE TOPIC(S) (including their subtopics)")
+        else:
+            logger.info(f"✅ No duplicates found - all topics are unique")
+
+        logger.info(f"✅ Deduplication complete - {len(categories_data)} unique top-level categories")
+
+        # VERIFICATION: Check for any remaining duplicates across entire hierarchy
+        def verify_no_duplicates(topics_list: list, all_titles: dict = None, path: str = "") -> tuple:
+            """
+            Verify no duplicate titles exist across the entire hierarchy.
+            Returns (is_valid, duplicate_info_list)
+            """
+            if all_titles is None:
+                all_titles = {}
+
+            duplicates_found = []
+
+            for topic in topics_list:
+                title = topic.get("title", "").strip()
+                title_lower = title.lower()
+                current_path = f"{path}/{title}" if path else title
+
+                # Check if this title was seen before
+                if title_lower in all_titles:
+                    duplicates_found.append({
+                        "title": title,
+                        "first_seen": all_titles[title_lower],
+                        "duplicate_at": current_path
+                    })
+                else:
+                    all_titles[title_lower] = current_path
+
+                # Recursively check subtopics
+                if "subtopics" in topic and isinstance(topic["subtopics"], list):
+                    _, child_duplicates = verify_no_duplicates(
+                        topic["subtopics"],
+                        all_titles,
+                        current_path
+                    )
+                    duplicates_found.extend(child_duplicates)
+
+            return (len(duplicates_found) == 0, duplicates_found)
+
+        is_valid, found_duplicates = verify_no_duplicates(categories_data)
+        if not is_valid:
+            logger.error(f"❌ VERIFICATION FAILED: Found {len(found_duplicates)} duplicate(s) after deduplication:")
+            for dup in found_duplicates:
+                logger.error(f"   - '{dup['title']}' appears at both:")
+                logger.error(f"     1. {dup['first_seen']}")
+                logger.error(f"     2. {dup['duplicate_at']}")
+        else:
+            logger.info(f"✅ VERIFICATION PASSED: No duplicates found in entire hierarchy")
 
         # Count total subtopics for the session
         total_subtopics = sum(len(cat.get("subtopics", [])) for cat in categories_data)
@@ -1053,6 +1132,20 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
             else:
                 initial_workflow_stage = "locked"
 
+            # SAFETY CHECK: Ensure no duplicate title under same parent (database-level protection)
+            existing_sibling = db.query(Topic).filter(
+                Topic.study_session_id == study_session.id,
+                Topic.parent_topic_id == parent_topic_id,
+                Topic.title == topic_data["title"]
+            ).first()
+
+            if existing_sibling:
+                logger.error(
+                    f"❌ DATABASE DUPLICATE DETECTED: Topic '{topic_data['title']}' already exists "
+                    f"under parent {parent_topic_id} (session {study_session.id}). Skipping creation."
+                )
+                return None
+
             # Create topic in database
             topic = Topic(
                 study_session_id=study_session.id,
@@ -1065,6 +1158,7 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
             )
             db.add(topic)
             db.flush()
+            logger.debug(f"✅ Created topic '{topic_data['title']}' (ID: {topic.id}, path: {path})")
 
             # Create schema
             topic_schema = TopicSchema(
@@ -1120,6 +1214,12 @@ Note: An EMPTY subtopics array [] means this is a LEAF NODE that will have quest
             )
             if category_schema:
                 all_topics.append(category_schema)
+
+        # FINAL SUMMARY: Report total topics created
+        total_topics_in_db = db.query(Topic).filter(Topic.study_session_id == study_session.id).count()
+        logger.info(f"📊 FINAL TOPIC COUNT: {total_topics_in_db} total topics created (all unique, no duplicates)")
+        logger.info(f"   └─ Top-level categories: {len(all_topics)}")
+        logger.info(f"   └─ All subtopics (for questions): {len(subtopic_map)}")
 
         # Step 4: Generate questions by processing each document chunk
         # For large documents, this processes multiple chunks separately and merges results
