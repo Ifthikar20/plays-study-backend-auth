@@ -48,6 +48,7 @@ const response = await axios.post('/api/v1/study-sessions', {
   ],
   "progressiveLoad": true,     // 🔔 Progressive loading is enabled
   "questionsRemaining": 11,    // 🔔 11 topics still need questions
+  "redirectUrl": "/dashboard/550e8400-e29b-41d4-a716-446655440000/full-study",  // 🔔 Where to redirect after creation
   "progress": 0
 }
 ```
@@ -75,6 +76,7 @@ interface Session {
   extractedTopics: Topic[];
   progressiveLoad: boolean;
   questionsRemaining: number;
+  redirectUrl: string;  // Where to redirect after session creation
 }
 
 const StudySessionPage = () => {
@@ -95,7 +97,12 @@ const StudySessionPage = () => {
     setSession(data);
     setQuestionsRemaining(data.questionsRemaining || 0);
 
-    // Step 2: Start loading remaining questions in background
+    // Step 2: Redirect immediately using the provided redirect URL
+    if (data.redirectUrl) {
+      navigate(data.redirectUrl);  // Navigate to /dashboard/{sessionId}/full-study
+    }
+
+    // Step 3: Start loading remaining questions in background
     if (data.questionsRemaining > 0) {
       loadRemainingQuestions(data.id, data.extractedTopics.length);
     }

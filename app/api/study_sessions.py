@@ -549,6 +549,7 @@ class CreateStudySessionResponse(BaseModel):
     createdAt: Optional[int] = None  # Unix timestamp in milliseconds
     progressiveLoad: Optional[bool] = False  # Whether questions are loading progressively
     questionsRemaining: Optional[int] = 0  # Number of topics without questions yet
+    redirectUrl: str  # Explicit URL for frontend to redirect to after session creation
 
 
 @router.post("/analyze-content", response_model=ContentAnalysisResponse)
@@ -804,7 +805,8 @@ async def create_study_session_with_ai(
                 hasSpeedRun=True,
                 createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None,
                 progressiveLoad=False,  # Cached sessions have all questions already
-                questionsRemaining=0  # All questions already generated from cache
+                questionsRemaining=0,  # All questions already generated from cache
+                redirectUrl=f"/dashboard/{study_session.id}/full-study"  # Explicit redirect path
             )
 
         logger.info(f"📝 Cache MISS - Generating new AI content for hash {content_hash}")
@@ -1773,7 +1775,8 @@ REMINDER: The response MUST include questions for ALL {len(batch_keys)} topics l
             hasSpeedRun=True,
             createdAt=int(study_session.created_at.timestamp() * 1000) if study_session.created_at else None,
             progressiveLoad=progressive_load_value,
-            questionsRemaining=topics_without_questions
+            questionsRemaining=topics_without_questions,
+            redirectUrl=f"/dashboard/{study_session.id}/full-study"  # Explicit redirect path
         )
 
     except HTTPException:
