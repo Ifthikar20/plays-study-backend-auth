@@ -34,41 +34,32 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     Returns:
         True if password matches, False otherwise
     """
-    logger.debug(f"🔐 Verifying password (length: {len(plain_password)})")
-    logger.debug(f"🔐 Hashed password (first 20 chars): {hashed_password[:20]}...")
-
     try:
         result = pwd_context.verify(plain_password, hashed_password)
-        logger.debug(f"🔐 Password verification with bcrypt: {result}")
         return result
     except Exception as e:
-        # Fallback for development: simple hash comparison
-        logger.warning(f"🔐 Bcrypt failed, using SHA256 fallback: {e}")
-        import hashlib
-        simple_hash = hashlib.sha256(plain_password.encode()).hexdigest()
-        result = simple_hash == hashed_password
-        logger.debug(f"🔐 SHA256 hash: {simple_hash[:20]}...")
-        logger.debug(f"🔐 Password verification with SHA256: {result}")
-        return result
+        logger.error(f"🔐 Password verification failed: {e}")
+        return False
 
 
 def get_password_hash(password: str) -> str:
     """
-    Hash a password using bcrypt (with fallback).
+    Hash a password using bcrypt.
 
     Args:
         password: The plain text password to hash
 
     Returns:
         The hashed password
+
+    Raises:
+        RuntimeError: If password hashing fails
     """
     try:
         return pwd_context.hash(password)
     except Exception as e:
-        # Fallback for development
-        import hashlib
-        print(f"Warning: Using fallback password hashing due to: {e}")
-        return hashlib.sha256(password.encode()).hexdigest()
+        logger.error(f"🔐 Password hashing failed: {e}")
+        raise RuntimeError("Password hashing unavailable") from e
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -92,12 +83,8 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode.update({"exp": expire})
 
     logger.debug(f"🎫 Creating access token for user: {data.get('email', 'unknown')}")
-    logger.debug(f"🎫 Token data: {to_encode}")
-    logger.debug(f"🎫 Token expires at: {expire}")
 
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-
-    logger.debug(f"🎫 Created token (first 50 chars): {encoded_jwt[:50]}...")
 
     return encoded_jwt
 
@@ -112,12 +99,9 @@ def decode_access_token(token: str) -> Optional[dict]:
     Returns:
         Dictionary of decoded token data, or None if invalid
     """
-    logger.debug(f"🔓 Decoding access token (first 50 chars): {token[:50]}...")
-
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        logger.debug(f"🔓 Token decoded successfully: {payload}")
         return payload
     except JWTError as e:
-        logger.error(f"🔓 Token decode failed: {e}")
+        logger.warning(f"🔓 Token decode failed: {type(e).__name__}")
         return None

@@ -38,7 +38,6 @@ def get_current_user(
     logger.debug("👤 get_current_user called")
 
     token = credentials.credentials
-    logger.debug(f"👤 Received token (first 50 chars): {token[:50]}...")
 
     # Decode token
     payload = decode_access_token(token)
@@ -50,7 +49,6 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    logger.debug(f"👤 Token payload: {payload}")
 
     # Extract user ID from token (convert string to int)
     user_id_str = payload.get("sub")
@@ -72,7 +70,6 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    logger.debug(f"👤 Looking up user with ID: {user_id}")
 
     # Get user from database
     user = db.query(User).filter(User.id == user_id).first()
@@ -84,7 +81,7 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    logger.debug(f"👤 User found: {user.email}, Active: {user.is_active}")
+    logger.debug(f"👤 User {user.id} authenticated successfully")
 
     # Check if user is active
     if not user.is_active:

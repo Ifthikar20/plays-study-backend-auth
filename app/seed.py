@@ -2,6 +2,8 @@
 Database seeding script to populate initial data.
 Run this after creating the database to add sample games.
 """
+import os
+import secrets
 from app.database import SessionLocal, engine, Base
 from app.models.game import Game
 from app.models.user import User
@@ -115,19 +117,21 @@ def seed_database():
 
         # Create a test user (optional)
         try:
-            existing_user = db.query(User).filter(User.email == "test@example.com").first()
+            test_email = os.environ.get("SEED_TEST_EMAIL", "test@example.com")
+            test_password = os.environ.get("SEED_TEST_PASSWORD", secrets.token_urlsafe(16))
+            existing_user = db.query(User).filter(User.email == test_email).first()
             if not existing_user:
                 test_user = User(
-                    email="test@example.com",
+                    email=test_email,
                     name="Test User",
-                    hashed_password=get_password_hash("password123"),
+                    hashed_password=get_password_hash(test_password),
                     xp=250,
                     level=3,
                     is_active=True,
                 )
                 db.add(test_user)
                 db.commit()
-                print("✓ Created test user: test@example.com / password123")
+                print(f"✓ Created test user: {test_email}")
             else:
                 print("Test user already exists, skipping...")
         except Exception as e:

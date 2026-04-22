@@ -51,7 +51,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 
 # Terminal 2: Start Main Backend
 export ML_SERVICE_URL="http://localhost:8001"
-export DATABASE_URL="postgresql://playstudy_user:dev_password_change_in_production@localhost:5432/playstudy_db"
+export DATABASE_URL="postgresql://playstudy_user:YOUR_PASSWORD@localhost:5432/playstudy_db"
 export REDIS_URL="redis://localhost:6379/0"
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

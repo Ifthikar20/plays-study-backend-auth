@@ -202,8 +202,7 @@ async def login_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    logger.debug(f"🔑 User found: ID={user.id}, Name={user.name}, Active={user.is_active}")
-    logger.debug(f"🔑 Stored hash (first 20 chars): {user.hashed_password[:20]}...")
+    logger.debug(f"🔑 User found for login attempt")
 
     # Verify password
     password_valid = verify_password(password, user.hashed_password)

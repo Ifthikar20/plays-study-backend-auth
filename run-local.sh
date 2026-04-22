@@ -56,11 +56,11 @@ done
 
 echo -e "${GREEN}[4/4]${NC} Starting main backend on port 8000..."
 export ML_SERVICE_URL="http://localhost:8001"
-export DATABASE_URL="${DATABASE_URL:-postgresql://playstudy_admin:yourpassword@localhost:5432/postgres}"
+export DATABASE_URL="${DATABASE_URL:-postgresql://playstudy_admin@localhost:5432/postgres}"
 export REDIS_URL="${REDIS_URL:-redis://localhost:6379/0}"
 export ALLOWED_ORIGINS="http://localhost:8080,http://localhost:3000"
-export SECRET_KEY="dev-secret-key"
-export FIELD_ENCRYPTION_KEY="dev-encryption-key"
+export SECRET_KEY="${SECRET_KEY:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}"
+export FIELD_ENCRYPTION_KEY="${FIELD_ENCRYPTION_KEY:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}"
 
 echo ""
 echo -e "${BLUE}========================================${NC}"

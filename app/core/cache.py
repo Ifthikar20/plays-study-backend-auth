@@ -6,8 +6,16 @@ import redis
 from typing import Optional, Any
 from app.config import settings
 
-# Create Redis client
-redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+# Create Redis client (graceful — works without Redis for local dev)
+try:
+    redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+    redis_client.ping()  # Test connection
+    import logging
+    logging.getLogger(__name__).info("[Cache] ✅ Redis connected")
+except Exception as e:
+    import logging
+    logging.getLogger(__name__).warning(f"[Cache] ⚠️ Redis unavailable, caching disabled: {e}")
+    redis_client = None
 
 
 def get_cache(key: str) -> Optional[Any]:
@@ -20,6 +28,8 @@ def get_cache(key: str) -> Optional[Any]:
     Returns:
         The cached value if exists, None otherwise
     """
+    if redis_client is None:
+        return None
     try:
         value = redis_client.get(key)
         if value:
@@ -41,6 +51,8 @@ def set_cache(key: str, value: Any, ttl: Optional[int] = None) -> bool:
     Returns:
         True if successful, False otherwise
     """
+    if redis_client is None:
+        return False
     try:
         ttl = ttl or settings.CACHE_TTL
         serialized = json.dumps(value)
@@ -60,6 +72,8 @@ def delete_cache(key: str) -> bool:
     Returns:
         True if successful, False otherwise
     """
+    if redis_client is None:
+        return False
     try:
         redis_client.delete(key)
         return True

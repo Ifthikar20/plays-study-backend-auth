@@ -4,6 +4,7 @@ Database seeding script to populate with sample data.
 import sys
 from pathlib import Path
 import os
+import secrets
 
 # Add backend directory to Python path
 backend_dir = Path(__file__).parent
@@ -84,21 +85,26 @@ def seed_database():
         db.query(User).delete()
         db.commit()
 
-        # Create sample users
+        # Create sample users from environment variables or generate random credentials
         print("Creating sample users...")
+        user1_email = os.environ.get("SEED_USER1_EMAIL", f"user1_{secrets.token_hex(4)}@example.com")
+        user1_password = os.environ.get("SEED_USER1_PASSWORD", secrets.token_urlsafe(16))
+        user2_email = os.environ.get("SEED_USER2_EMAIL", f"user2_{secrets.token_hex(4)}@example.com")
+        user2_password = os.environ.get("SEED_USER2_PASSWORD", secrets.token_urlsafe(16))
+
         users = [
             User(
-                email="student@playstudy.ai",
+                email=user1_email,
                 name="Student User",
-                hashed_password=get_password_hash_safe("password123"),
+                hashed_password=get_password_hash_safe(user1_password),
                 xp=2450,
                 level=12,
                 is_active=True,
             ),
             User(
-                email="demo@playstudy.ai",
+                email=user2_email,
                 name="Demo User",
-                hashed_password=get_password_hash_safe("demo123"),
+                hashed_password=get_password_hash_safe(user2_password),
                 xp=1200,
                 level=8,
                 is_active=True,
@@ -417,9 +423,12 @@ def seed_database():
         print(f"  Users: {len(users)}")
         print(f"  Games: {len(games)}")
         print(f"  Study Sessions: {len(sessions)}")
-        print("\n👤 Test accounts:")
-        print("  Email: student@playstudy.ai | Password: password123")
-        print("  Email: demo@playstudy.ai | Password: demo123")
+        print("\n👤 Seeded accounts:")
+        print(f"  User 1: {user1_email}")
+        print(f"  User 2: {user2_email}")
+        if not os.environ.get("SEED_USER1_EMAIL"):
+            print("\n  ⚠️  Random credentials were generated. Set SEED_USER1_EMAIL/PASSWORD")
+            print("     environment variables to use specific credentials.")
 
     except Exception as e:
         print(f"\n❌ Error seeding database: {str(e)}")
