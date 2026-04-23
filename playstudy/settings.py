@@ -5,6 +5,7 @@ Secure, production-ready configuration.
 import os
 from pathlib import Path
 from datetime import timedelta
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,6 +29,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     # Third party
     'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     # Local apps
     'accounts',
@@ -45,6 +47,16 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+# CSRF is enforced for admin only. DRF's JWTAuthentication is CSRF-exempt by
+# default, so pure API endpoints are safe without extra config.
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        'CSRF_TRUSTED_ORIGINS',
+        'http://localhost:8080,http://localhost:5173,http://localhost:3000'
+    ).split(',')
 ]
 
 ROOT_URLCONF = 'playstudy.urls'
@@ -70,31 +82,39 @@ WSGI_APPLICATION = 'playstudy.wsgi.application'
 # ─── Database ─────────────────────────────────────────────
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./playstudy_dev.db')
 
-if DATABASE_URL.startswith('postgresql'):
-    DATABASES = {
-        'default': {
+
+def _parse_database_url(url: str) -> dict:
+    """Parse a DATABASE_URL into a Django DATABASES config dict."""
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+
+    if scheme.startswith('postgres'):
+        return {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': DATABASE_URL.split('/')[-1].split('?')[0],
-            'USER': DATABASE_URL.split('://')[1].split(':')[0],
-            'PASSWORD': DATABASE_URL.split(':')[2].split('@')[0],
-            'HOST': DATABASE_URL.split('@')[1].split(':')[0].split('/')[0],
-            'PORT': DATABASE_URL.split('@')[1].split(':')[1].split('/')[0] if ':' in DATABASE_URL.split('@')[1] else '5432',
+            'NAME': (parsed.path or '/').lstrip('/') or 'postgres',
+            'USER': parsed.username or '',
+            'PASSWORD': parsed.password or '',
+            'HOST': parsed.hostname or 'localhost',
+            'PORT': str(parsed.port) if parsed.port else '5432',
             'CONN_MAX_AGE': 600,
-            'OPTIONS': {
-                'connect_timeout': 10,
-            },
+            'OPTIONS': {'connect_timeout': 10},
         }
-    }
-else:
-    db_path = DATABASE_URL.replace('sqlite:///', '')
-    if not db_path or db_path == '.':
+
+    # sqlite:///relative or sqlite:////absolute
+    raw_path = url[len('sqlite:///'):] if url.startswith('sqlite:///') else (parsed.path or '').lstrip('/')
+    if not raw_path or raw_path == '.':
         db_path = str(BASE_DIR / 'playstudy_dev.db')
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': db_path,
-        }
+    elif raw_path.startswith('/'):
+        db_path = raw_path
+    else:
+        db_path = str(BASE_DIR / raw_path)
+    return {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': db_path,
     }
+
+
+DATABASES = {'default': _parse_database_url(DATABASE_URL)}
 
 # ─── Custom User Model ───────────────────────────────────
 AUTH_USER_MODEL = 'accounts.User'

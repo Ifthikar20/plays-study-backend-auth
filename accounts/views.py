@@ -1,4 +1,4 @@
-"""Auth views — Register, Login, Profile. All token responses match the existing FastAPI contract."""
+"""Auth views — register, login, refresh, logout, profile."""
 import logging
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
@@ -6,6 +6,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import AnonRateThrottle
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 from django.contrib.auth import get_user_model, authenticate
 from .serializers import RegisterSerializer, LoginSerializer, UserSerializer
 
@@ -18,9 +19,8 @@ class AuthRateThrottle(AnonRateThrottle):
 
 
 def _token_response(user):
-    """Generate JWT token pair and return response matching FastAPI contract."""
+    """Generate an access+refresh token pair with extra claims."""
     refresh = RefreshToken.for_user(user)
-    # Add email claim to match existing frontend expectations
     refresh['email'] = user.email
     refresh['sub'] = str(user.id)
     access = refresh.access_token
@@ -29,6 +29,7 @@ def _token_response(user):
 
     return {
         'access_token': str(access),
+        'refresh_token': str(refresh),
         'token_type': 'bearer',
         'expires_in': int(access.lifetime.total_seconds()),
     }
@@ -38,21 +39,14 @@ def _token_response(user):
 @permission_classes([AllowAny])
 @throttle_classes([AuthRateThrottle])
 def register(request):
-    """
-    POST /api/auth/register
-    Create a new user account and return JWT token.
-    """
+    """POST /api/auth/register — create account, return token pair."""
     serializer = RegisterSerializer(data=request.data)
     if not serializer.is_valid():
-        # Return first error message as 'detail' to match FastAPI format
         first_error = next(iter(serializer.errors.values()))[0]
-        return Response(
-            {'detail': str(first_error)},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'detail': str(first_error)}, status=status.HTTP_400_BAD_REQUEST)
 
     user = serializer.save()
-    logger.info(f'✅ New user registered: {user.email}')
+    logger.info('New user registered: %s', user.email)
     return Response(_token_response(user), status=status.HTTP_201_CREATED)
 
 
@@ -60,45 +54,69 @@ def register(request):
 @permission_classes([AllowAny])
 @throttle_classes([AuthRateThrottle])
 def login(request):
-    """
-    POST /api/auth/login
-    Authenticate and return JWT token.
-    """
+    """POST /api/auth/login — authenticate, return token pair."""
     serializer = LoginSerializer(data=request.data)
     if not serializer.is_valid():
-        return Response(
-            {'detail': 'Email and password are required'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'detail': 'Email and password are required'}, status=status.HTTP_400_BAD_REQUEST)
 
     email = serializer.validated_data['email'].lower()
     password = serializer.validated_data['password']
 
-    # Authenticate using Django's backend
     user = authenticate(request, username=email, password=password)
-
     if user is None:
-        logger.warning(f'🔑 Login failed for: {email}')
-        return Response(
-            {'detail': 'Incorrect email or password'},
-            status=status.HTTP_401_UNAUTHORIZED
-        )
-
+        logger.warning('Login failed for: %s', email)
+        return Response({'detail': 'Incorrect email or password'}, status=status.HTTP_401_UNAUTHORIZED)
     if not user.is_active:
-        return Response(
-            {'detail': 'Account is inactive'},
-            status=status.HTTP_403_FORBIDDEN
-        )
+        return Response({'detail': 'Account is inactive'}, status=status.HTTP_403_FORBIDDEN)
 
-    logger.info(f'🔑 Login successful: {email}')
+    logger.info('Login successful: %s', email)
     return Response(_token_response(user))
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([AuthRateThrottle])
+def refresh(request):
+    """POST /api/auth/refresh — exchange a refresh token for a fresh access token."""
+    refresh_token = request.data.get('refresh_token') or request.data.get('refresh')
+    if not refresh_token:
+        return Response({'detail': 'refresh_token is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        token = RefreshToken(refresh_token)
+        # Rotation + blacklist are enabled in settings, so this returns a new pair.
+        access = token.access_token
+        new_refresh = str(token)
+        try:
+            token.blacklist()
+        except Exception:
+            pass
+    except (TokenError, InvalidToken) as exc:
+        return Response({'detail': str(exc) or 'Invalid refresh token'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    return Response({
+        'access_token': str(access),
+        'refresh_token': new_refresh,
+        'token_type': 'bearer',
+        'expires_in': int(access.lifetime.total_seconds()),
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout(request):
+    """POST /api/auth/logout — blacklist the refresh token."""
+    refresh_token = request.data.get('refresh_token') or request.data.get('refresh')
+    if refresh_token:
+        try:
+            RefreshToken(refresh_token).blacklist()
+        except (TokenError, InvalidToken):
+            pass
+    return Response({'detail': 'Logged out'})
 
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def profile(request):
-    """
-    GET /api/auth/profile
-    Return current user's profile.
-    """
+    """GET /api/auth/profile — current user's profile."""
     return Response(UserSerializer(request.user).data)

@@ -8,7 +8,8 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
-from .models import StudySession, Topic, Question
+from django.db import transaction
+from .models import StudySession, Topic, Question, Flashcard
 from .serializers import StudySessionListSerializer, StudySessionDetailSerializer
 from .permissions import IsSessionOwner
 
@@ -135,7 +136,13 @@ def create_with_ai(request):
     Create a study session with AI-generated topics and questions.
     IDOR-safe: session is always created under request.user.
     """
-    from study.services.ai_service import extract_text, detect_file_type, analyze_complexity, generate_topics_and_questions
+    from study.services.ai_service import (
+        detect_file_type,
+        analyze_complexity,
+        generate_topics_and_questions,
+        ensure_flashcards_on_subtopic,
+        _sentences,
+    )
 
     title = request.data.get('title', '')
     content = request.data.get('content', '')
@@ -159,59 +166,85 @@ def create_with_ai(request):
 
         analysis = analyze_complexity(extracted_text)
 
-        # Create the study session
-        session = StudySession.objects.create(
-            user=request.user,
-            title=title,
-            topic=title,
-            study_content=extracted_text,
-            file_content=file_content,
-            file_type=file_type,
-            topics_count=min(num_topics, analysis['recommended_topics']),
-            has_full_study=True,
-            has_speed_run=True,
-            status='in_progress',
-        )
-
-        # Generate topics and questions using AI
+        # Generate topics, questions, and flashcards using AI (or the deterministic fallback).
         topics_data = generate_topics_and_questions(
             extracted_text, num_topics, questions_per_topic
         )
 
-        # Save topics and questions to DB
-        for idx, t_data in enumerate(topics_data):
-            category = Topic.objects.create(
-                study_session=session,
-                title=t_data['title'],
-                description=t_data.get('description', ''),
-                order_index=idx,
-                is_category=True,
+        source_sentences = _sentences(extracted_text)
+        flashcards_created = 0
+        questions_created = 0
+
+        with transaction.atomic():
+            # Create the study session.
+            session = StudySession.objects.create(
+                user=request.user,
+                title=title,
+                topic=title,
+                study_content=extracted_text,
+                file_content=file_content,
+                file_type=file_type,
+                topics_count=min(num_topics, analysis['recommended_topics']),
+                has_full_study=True,
+                has_speed_run=True,
+                status='in_progress',
             )
 
-            for sub_idx, sub_data in enumerate(t_data.get('subtopics', [])):
-                subtopic = Topic.objects.create(
+            # Save topics, subtopics, questions, and flashcards.
+            for idx, t_data in enumerate(topics_data):
+                category = Topic.objects.create(
                     study_session=session,
-                    parent_topic=category,
-                    title=sub_data['title'],
-                    description=sub_data.get('description', ''),
-                    order_index=sub_idx,
-                    is_category=False,
-                    workflow_stage='quiz_available' if idx == 0 and sub_idx == 0 else 'locked',
+                    title=t_data['title'],
+                    description=t_data.get('description', ''),
+                    order_index=idx,
+                    is_category=True,
                 )
 
-                for q_idx, q_data in enumerate(sub_data.get('questions', [])):
-                    Question.objects.create(
-                        topic=subtopic,
-                        question=q_data['question'],
-                        options=q_data.get('options', []),
-                        correct_answer=q_data.get('correct_answer', 0),
-                        explanation=q_data.get('explanation', ''),
-                        source_text=q_data.get('source_text'),
-                        source_page=q_data.get('source_page'),
-                        order_index=q_idx,
+                for sub_idx, sub_data in enumerate(t_data.get('subtopics', [])):
+                    subtopic = Topic.objects.create(
+                        study_session=session,
+                        parent_topic=category,
+                        title=sub_data['title'],
+                        description=sub_data.get('description', ''),
+                        order_index=sub_idx,
+                        is_category=False,
+                        workflow_stage='quiz_available' if idx == 0 and sub_idx == 0 else 'locked',
                     )
 
+                    for q_idx, q_data in enumerate(sub_data.get('questions', [])):
+                        Question.objects.create(
+                            topic=subtopic,
+                            question=q_data['question'],
+                            options=q_data.get('options', []),
+                            correct_answer=q_data.get('correct_answer', 0),
+                            explanation=q_data.get('explanation', ''),
+                            source_text=q_data.get('source_text'),
+                            source_page=q_data.get('source_page'),
+                            order_index=q_idx,
+                        )
+                        questions_created += 1
+
+                    # Flashcards — fall back to deriving from questions if the AI didn't return any.
+                    flashcards = ensure_flashcards_on_subtopic(sub_data, source_sentences)
+                    for fc_idx, fc in enumerate(flashcards):
+                        front = (fc.get('front') or '').strip()
+                        back = (fc.get('back') or '').strip()
+                        if not front or not back:
+                            continue
+                        Flashcard.objects.create(
+                            topic=subtopic,
+                            front=front,
+                            back=back,
+                            hint=(fc.get('hint') or None),
+                            order_index=fc_idx,
+                        )
+                        flashcards_created += 1
+
         session.refresh_from_db()
+        logger.info(
+            'Session %s created for %s — %d questions, %d flashcards',
+            session.id, request.user.email, questions_created, flashcards_created,
+        )
 
         return Response({
             'id': str(session.id),
