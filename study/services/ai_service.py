@@ -143,28 +143,46 @@ def analyze_complexity(text: str) -> dict:
 
 def generate_topics_and_questions(text: str, num_topics: int, questions_per_topic: int) -> list:
     """
-    Use Anthropic/OpenAI to generate topics and questions from study content.
-    Returns list of topic dicts with subtopics and questions.
+    Generate topics, flashcards, and questions from study content.
+
+    Tries Anthropic first, then OpenAI, and finally the deterministic placeholder
+    generator. Any provider-level failure (network, model retired, malformed JSON)
+    falls through silently — the user always gets a usable session, even if every
+    AI provider is misconfigured.
     """
-    # Try Anthropic first, then OpenAI
     if settings.ANTHROPIC_API_KEY:
-        return _generate_with_anthropic(text, num_topics, questions_per_topic)
-    elif settings.OPENAI_API_KEY:
-        return _generate_with_openai(text, num_topics, questions_per_topic)
-    else:
-        logger.warning('No AI API key configured — generating placeholder topics')
-        return _generate_placeholder(text, num_topics, questions_per_topic)
+        try:
+            topics = _generate_with_anthropic(text, num_topics, questions_per_topic)
+            if topics:
+                return topics
+            logger.warning('Anthropic returned no topics — falling back')
+        except Exception as exc:
+            logger.warning('Anthropic generation failed (%s) — falling back', exc)
+
+    if settings.OPENAI_API_KEY:
+        try:
+            topics = _generate_with_openai(text, num_topics, questions_per_topic)
+            if topics:
+                return topics
+            logger.warning('OpenAI returned no topics — falling back')
+        except Exception as exc:
+            logger.warning('OpenAI generation failed (%s) — falling back', exc)
+
+    logger.info('Using deterministic placeholder topic generator')
+    return _generate_placeholder(text, num_topics, questions_per_topic)
 
 
 def _generate_with_anthropic(text: str, num_topics: int, qpt: int) -> list:
-    """Generate using Claude."""
+    """Generate using Claude Haiku 4.5 — fast and cheap for structured JSON."""
     from anthropic import Anthropic
 
     client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     prompt = _build_prompt(text, num_topics, qpt)
 
+    # Haiku 4.5 — current model (replaces the retired claude-3-5-haiku-latest).
+    # Cheap enough at $1/$5 per 1M tokens to use freely; max 64K output tokens.
     response = client.messages.create(
-        model='claude-3-5-haiku-latest',
+        model='claude-haiku-4-5',
         max_tokens=8000,
         messages=[{'role': 'user', 'content': prompt}],
     )
@@ -173,7 +191,7 @@ def _generate_with_anthropic(text: str, num_topics: int, qpt: int) -> list:
 
 
 def _generate_with_openai(text: str, num_topics: int, qpt: int) -> list:
-    """Generate using OpenAI."""
+    """Generate using OpenAI as a backup provider."""
     from openai import OpenAI
 
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
